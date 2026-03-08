@@ -1,0 +1,112 @@
+# MOD operator feature summary (ggml)
+
+## 1) 语义定义
+- 算子: `GGML_OP_MOD`
+- API: `ggml_mod(ctx, a, b)`, `ggml_mod_inplace(ctx, a, b)`
+- 计算语义: 使用 C/C++ 整数 `%` 余数语义（与 `a - trunc(a/b)*b` 一致）
+- 当前仅支持整型，不支持 float/bf16/f16。
+
+## 2) 类型支持
+- 支持: `I8`, `I16`, `I32`, `I64`
+- 要求: `src0->type == src1->type == dst->type`
+
+## 3) 形状/布局支持（当前实现）
+- 通用约束: `shape(dst) == shape(src0)`
+- 支持两类 RHS:
+1. `shape(src1) == shape(src0)`（逐元素 mod）
+2. `nelements(src1) == 1`（标量广播）
+- 其他 broadcast 形态当前不支持。
+
+## 4) 后端支持矩阵
+- CPU: 支持
+- CUDA: 支持
+- Vulkan: 支持
+
+### CPU
+- 要求 `src0/src1/dst` contiguous。
+- 支持 same-shape 或 scalar-broadcast。
+- 不满足时 `GGML_ABORT`。
+
+### CUDA
+- 前向调度接入 `GGML_OP_MOD`。
+- kernel:
+1. `k_mod_same_shape<T>`
+2. `k_mod_scalar<T>`
+- 要求 `src0/src1/dst` contiguous。
+- capability 仅在整型同类型 + 形状约束满足时返回 true。
+
+### Vulkan
+- 新增整型 shader: `mod_int.comp`。
+- 生成 4 组 SPIR-V: `mod_i8/mod_i16/mod_i32/mod_i64`。
+- pipeline 使用 `pipeline_mod_i[4][2]`:
+1. `[itype][0]` = repeat
+2. `[itype][1]` = norepeat
+- capability 改为仅整型同类型。
+
+## 5) 关键改动文件清单
+
+### Core API / Op
+- `include/ggml.h`
+1. `enum ggml_op` 增加 `GGML_OP_MOD`
+2. 声明 `ggml_mod`, `ggml_mod_inplace`
+
+- `src/ggml.c`
+1. op name/symbol 增加 `MOD`
+2. `GGML_OP_COUNT` 相关静态检查更新
+3. 新增 `ggml_mod_impl`, `ggml_mod`, `ggml_mod_inplace`
+4. `ggml_mod_impl` 增加整型类型约束和 `ggml_can_repeat`
+
+### CPU backend
+- `src/ggml-cpu/binary-ops.h`
+1. 声明 `ggml_compute_forward_mod`
+
+- `src/ggml-cpu/binary-ops.cpp`
+1. 新增 `ggml_compute_forward_mod_integral<T>`
+2. 新增 `ggml_compute_forward_mod` 类型分发
+
+- `src/ggml-cpu/ggml-cpu.c`
+1. `ggml_compute_forward` switch 接入 `GGML_OP_MOD`
+2. `ggml_get_n_tasks` 把 `GGML_OP_MOD` 归入并行任务分组
+
+### CUDA backend
+- `src/ggml-cuda/binbcast.cuh`
+1. 声明 `ggml_cuda_op_mod`
+
+- `src/ggml-cuda/binbcast.cu`
+1. 新增 `k_mod_same_shape<T>`
+2. 新增 `k_mod_scalar<T>`
+3. 新增 `ggml_cuda_op_mod_impl<T>`
+4. 新增 `ggml_cuda_op_mod`（I8/I16/I32/I64 分发）
+
+- `src/ggml-cuda/ggml-cuda.cu`
+1. forward switch 接入 `GGML_OP_MOD`
+2. CUDA capability 增加 `GGML_OP_MOD` 条件判定
+
+### Vulkan backend
+- `src/ggml-vulkan/vulkan-shaders/mod_int.comp`
+1. 新增整型 `%` shader
+
+- `src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp`
+1. 注册 `mod_i8/mod_i16/mod_i32/mod_i64`
+2. 移除 float `mod` 的 binary-family 生成路径依赖（改整型专用）
+
+- `src/ggml-vulkan/ggml-vulkan.cpp`
+1. 新增 `pipeline_mod_i[4][2]`
+2. pipeline 创建接入 `mod_i8/i16/i32/i64` repeat+norepeat
+3. `ggml_vk_op_get_pipeline` 中 `GGML_OP_MOD` 改为整型分发
+4. Vulkan capability 中 `GGML_OP_MOD` 改为整型同类型限制
+
+## 6) 已验证
+- `cmake --build build-cuda -j8` 通过
+- `cmake --build build-vulkan -j8` 通过
+
+## 7) 已知限制 / 建议在上游 CR 说明
+1. 当前 `MOD` 仅支持 contiguous + (same-shape 或 scalar-broadcast)。
+2. 除零行为未单独防护（保持后端原生行为/未定义行为风险），建议在文档明确。
+3. 若要补齐通用 broadcast，需要在 CPU/CUDA/Vulkan 三端统一索引逻辑。
+4. 建议补测试:
+   - type 覆盖: I8/I16/I32/I64
+   - shape 覆盖: same-shape, scalar RHS
+   - 负数输入语义对齐（与 C/C++ `%` 一致）
+   - 后端一致性（CPU vs CUDA vs Vulkan）
+

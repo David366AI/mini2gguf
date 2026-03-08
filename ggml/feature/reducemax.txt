@@ -1,0 +1,87 @@
+ReduceMax Feature Notes
+
+Overview
+- Added native GGML operator support for ReduceMax.
+- Current ggml reduction primitive is row-wise reduction on dimension ne[0].
+- Runtime supports ONNX-style axis by permuting target axis to ggml dim-0 before reduce, then optionally permuting back.
+
+1) ggml native op + API
+File: ggml/include/ggml.h
+- enum ggml_op includes GGML_OP_REDUCE_MAX
+  - around line 491
+- API declaration:
+  - ggml_reduce_max(ctx, a)
+  - around line 1054
+
+API contract
+- input type: F16/F32 only
+- output type: same as input
+- reduction dimension: ggml dim-0 (row-wise)
+- output shape: [1, ne1, ne2, ne3]
+
+2) op registration + graph op builder
+File: ggml/src/ggml.c
+- GGML_OP_NAME table includes "REDUCE_MAX"
+  - around line 966
+- GGML_OP_SYMBOL table includes "max(x)_k"
+  - around line 1078
+- ggml_reduce_max() implementation
+  - around line 2532
+
+ggml_reduce_max() behavior
+- validates type is F16/F32
+- allocates output with ne[0] forced to 1, other dims unchanged
+- sets op = GGML_OP_REDUCE_MAX
+- stores src[0] = input tensor
+
+3) CPU kernel implementation
+Files:
+- ggml/src/ggml-cpu/ops.h
+  - declaration: ggml_compute_forward_reduce_max(...)
+  - around line 39
+- ggml/src/ggml-cpu/ops.cpp
+  - F32 kernel: ggml_compute_forward_reduce_max_f32
+    - around line 1561
+  - F16 kernel: ggml_compute_forward_reduce_max_f16
+    - around line 1594
+  - dispatcher: ggml_compute_forward_reduce_max
+    - around line 1629
+
+Kernel details
+- one-thread compute path (ith != 0 returns)
+- F32: uses ggml_vec_max_f32 over ne00
+- F16: loops over ne00, converts fp16->fp32 for max accumulation, writes fp16 result
+- requires output ne0 == 1 and remaining dims equal input
+
+4) CPU dispatcher integration
+File: ggml/src/ggml-cpu/ggml-cpu.c
+- forward switch includes GGML_OP_REDUCE_MAX -> ggml_compute_forward_reduce_max(...)
+  - around line 1769
+- task scheduling groups REDUCE_MAX under single-task ops
+  - around line 2210
+
+5) Runtime ONNX ReduceMax mapping (important)
+File: runtime/src/model_runtime.cpp
+- ReduceMax node handling starts
+  - around line 1438
+- supports input dtype F16/F32
+- supports axis from attributes or second input tensor
+- currently supports single-axis reduction only
+- maps ONNX axis to ggml axis using existing runtime mapping
+- if axis != ggml dim-0:
+  - permute target axis to front
+  - call ggml_reduce_max
+  - permute result back
+- keepdims handling:
+  - keepdims=1: keep reduced axis as size-1 dim
+  - keepdims=0: squeeze reduced axis via reshape_1d/2d/3d
+
+Notes and limitations
+- ggml primitive itself has no axis parameter; axis support is implemented in runtime by permute strategy.
+- runtime currently allows only one axis for ReduceMax.
+- behavior for axis=-1 depends on existing axis mapping helper used by your runtime.
+
+Build verification status
+- CPU build: pass
+- CUDA build: pass
+- Vulkan build: pass

@@ -1,0 +1,81 @@
+GatherElements (CPU) Feature Notes
+
+Overview
+- Added native GGML operator support for GatherElements.
+- Runtime no longer needs custom map_custom3 gather callback for this op.
+- Current implementation scope: CPU only.
+
+1) ggml native op + API
+File: ggml/include/ggml.h
+- enum ggml_op: added GGML_OP_GATHER_ELEMENTS
+  - around line 481
+- API declaration added:
+  - ggml_gather_elements(ctx, a, indices, axis)
+  - around line 972
+
+Behavior contract (API)
+- data tensor (a): only F16/F32
+- indices tensor: only I32/I64
+- axis: 0..3 (ggml axis space)
+- output type: same as data
+- output shape: same as indices
+
+2) op registration + graph op builder
+File: ggml/src/ggml.c
+- GGML_OP_NAME table: inserted "GATHER_ELEMENTS"
+  - around line 956
+- GGML_OP_SYMBOL table: inserted "gather_elements(x, indices, axis)"
+  - around line 1068
+- GGML_OP_COUNT static_assert updated (97 -> 98)
+  - around line 1054
+- Added ggml_gather_elements() implementation
+  - around line 2289
+
+ggml_gather_elements() checks
+- validates data type (F16/F32)
+- validates indices type (I32/I64)
+- validates axis range [0, GGML_MAX_DIMS)
+- validates rank compatibility and non-axis dimension equality
+- creates output tensor with indices shape and data type
+- stores axis in op_params slot 0
+
+3) CPU kernel implementation
+Files:
+- ggml/src/ggml-cpu/binary-ops.h
+  - added forward declaration:
+    ggml_compute_forward_gather_elements(...)
+  - around line 14
+- ggml/src/ggml-cpu/binary-ops.cpp
+  - added typed kernel implementation
+  - around line 217
+
+Kernel details
+- supports:
+  - data: F16/F32
+  - indices: I32/I64
+- supports negative indices (Python/ONNX style): idx < 0 -> idx += axis_size
+- axis is read from op_params[0]
+- output shape must equal indices shape
+- each output element computes source coordinates by replacing only the axis coordinate with gather_index
+
+4) CPU dispatcher integration
+File: ggml/src/ggml-cpu/ggml-cpu.c
+- forward switch: added case GGML_OP_GATHER_ELEMENTS -> ggml_compute_forward_gather_elements(...)
+  - around line 1729
+- task scheduler switch: added GGML_OP_GATHER_ELEMENTS to threaded task group
+  - around line 2201
+
+5) Runtime side simplification (for your context)
+File: runtime/src/model_runtime.cpp
+- removed large custom gather callback/template implementation
+- GatherElements node now calls ggml_gather_elements(ctx, data, indices, axis_ggml) directly
+
+Current scope and backend notes
+- Implemented backend path: CPU
+- CUDA/Vulkan: no dedicated GatherElements kernel added in this change
+  - behavior depends on existing backend support/fallback path in your runtime/backend wiring
+
+Quick verification performed
+- build (CPU): pass
+- build-cuda: pass
+- build-vulkan: pass

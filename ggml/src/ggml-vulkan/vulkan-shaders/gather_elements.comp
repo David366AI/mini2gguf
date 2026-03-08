@@ -1,0 +1,57 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint idx = get_idx();
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 2;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            idx += num_threads;
+            continue;
+        }
+
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03);
+
+        int64_t gather_index = int64_t(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+        int64_t axis_size = 1;
+        switch (p.param3) {
+            case 0: axis_size = int64_t(p.ne00); break;
+            case 1: axis_size = int64_t(p.ne01); break;
+            case 2: axis_size = int64_t(p.ne02); break;
+            case 3: axis_size = int64_t(p.ne03); break;
+        }
+        if (gather_index < 0) {
+            gather_index += axis_size;
+        }
+
+        uint d00 = i00;
+        uint d01 = i01;
+        uint d02 = i02;
+        uint d03 = i03;
+
+        if (p.param3 == 0) {
+            d00 = uint(gather_index);
+        } else if (p.param3 == 1) {
+            d01 = uint(gather_index);
+        } else if (p.param3 == 2) {
+            d02 = uint(gather_index);
+        } else {
+            d03 = uint(gather_index);
+        }
+
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] =
+            data_a[get_aoffset() + src0_idx(d00, d01, d02, d03)];
+
+        idx += num_threads;
+    }
+}
