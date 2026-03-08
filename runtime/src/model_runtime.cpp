@@ -2251,6 +2251,11 @@ namespace mini2gguf
                     x_soft = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
                 }
 
+                if (!ggml_is_contiguous(x_soft))
+                {
+                    x_soft = ggml_cont(ctx, x_soft);
+                }
+
                 ggml_tensor *y = ggml_soft_max(ctx, x_soft);
                 if (axis_ggml != 0)
                 {
