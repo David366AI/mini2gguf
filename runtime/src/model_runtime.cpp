@@ -1750,7 +1750,41 @@ namespace mini2gguf
                     {
                         return fail_with_cleanup("Conv grouped mode unsupported (non-depthwise): " + node.name);
                     }
-                    y = ggml_conv_2d_dw(ctx, w, x, s0, s1, p0, p1, d0, d1);
+                    const bool disable_cpu_conv_direct = env_flag_enabled("MINI2GGUF_DISABLE_CPU_CONV_DIRECT");
+                    const ggml_backend_t backend = reinterpret_cast<ggml_backend_t>(backend_);
+                    const ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+                    const bool is_cpu_backend = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                    const bool can_use_dw_direct = !disable_cpu_conv_direct && is_cpu_backend;
+
+                    if (can_use_dw_direct)
+                    {
+                        ggml_tensor *w_direct = w;
+                        ggml_tensor *x_direct = x;
+
+                        if (w_direct->type != GGML_TYPE_F32)
+                        {
+                            w_direct = ggml_cast(ctx, w_direct, GGML_TYPE_F32);
+                        }
+                        if (x_direct->type != GGML_TYPE_F32)
+                        {
+                            x_direct = ggml_cast(ctx, x_direct, GGML_TYPE_F32);
+                        }
+
+                        if (!ggml_is_contiguous(w_direct))
+                        {
+                            w_direct = ggml_cont(ctx, w_direct);
+                        }
+                        if (!ggml_is_contiguous(x_direct) && !ggml_is_contiguous_channels(x_direct))
+                        {
+                            x_direct = ggml_cont(ctx, x_direct);
+                        }
+
+                        y = ggml_conv_2d_dw_direct(ctx, w_direct, x_direct, s0, s1, p0, p1, d0, d1);
+                    }
+                    else
+                    {
+                        y = ggml_conv_2d_dw(ctx, w, x, s0, s1, p0, p1, d0, d1);
+                    }
                 }
                 if (node.inputs.size() >= 3)
                 {
@@ -1768,7 +1802,9 @@ namespace mini2gguf
                     {
                         b_for_add = ggml_cast(ctx, b_for_add, y->type);
                     }
-                    y = ggml_add(ctx, y, ggml_repeat(ctx, b_for_add, y));
+                    // ggml_add supports broadcast (ggml_can_repeat on src1), so avoid
+                    // materializing an explicit REPEAT tensor for Conv bias.
+                    y = ggml_add(ctx, y, b_for_add);
                 }
                 values[node.outputs[0]] = y;
                 continue;
