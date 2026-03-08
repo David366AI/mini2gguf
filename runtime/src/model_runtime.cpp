@@ -1700,6 +1700,8 @@ namespace mini2gguf
                 }
 
                 ggml_tensor *y = nullptr;
+                ggml_tensor *conv_bias = node.inputs.size() >= 3 ? values.at(node.inputs[2]) : nullptr;
+                bool fused_conv_bias = false;
                 if (node.group == 1)
                 {
                     if (w->ne[2] != x->ne[2])
@@ -1733,7 +1735,34 @@ namespace mini2gguf
                             x_direct = ggml_cast(ctx, x_direct, GGML_TYPE_F32);
                         }
 
-                        y = ggml_conv_2d_direct(ctx, w_direct, x_direct, s0, s1, p0, p1, d0, d1);
+                        ggml_tensor *bias_direct = nullptr;
+                        if (conv_bias != nullptr)
+                        {
+                            const bool bias_1d = ggml_n_dims(conv_bias) == 1 && conv_bias->ne[0] == w_direct->ne[3];
+                            const bool bias_4d = ggml_n_dims(conv_bias) == 4 &&
+                                conv_bias->ne[0] == 1 &&
+                                conv_bias->ne[1] == 1 &&
+                                conv_bias->ne[2] == w_direct->ne[3] &&
+                                (conv_bias->ne[3] == 1 || conv_bias->ne[3] == x_direct->ne[3]);
+                            if (bias_1d || bias_4d)
+                            {
+                                bias_direct = conv_bias;
+                                if (bias_direct->type != x_direct->type)
+                                {
+                                    bias_direct = ggml_cast(ctx, bias_direct, x_direct->type);
+                                }
+                            }
+                        }
+
+                        if (bias_direct != nullptr)
+                        {
+                            y = ggml_conv_2d_direct_bias(ctx, w_direct, x_direct, bias_direct, s0, s1, p0, p1, d0, d1);
+                            fused_conv_bias = true;
+                        }
+                        else
+                        {
+                            y = ggml_conv_2d_direct(ctx, w_direct, x_direct, s0, s1, p0, p1, d0, d1);
+                        }
                     }
                     else
                     {
@@ -1779,14 +1808,41 @@ namespace mini2gguf
                             x_direct = ggml_cont(ctx, x_direct);
                         }
 
-                        y = ggml_conv_2d_dw_direct(ctx, w_direct, x_direct, s0, s1, p0, p1, d0, d1);
+                        ggml_tensor *bias_direct = nullptr;
+                        if (conv_bias != nullptr)
+                        {
+                            const bool bias_1d = ggml_n_dims(conv_bias) == 1 && conv_bias->ne[0] == x_direct->ne[2];
+                            const bool bias_4d = ggml_n_dims(conv_bias) == 4 &&
+                                conv_bias->ne[0] == 1 &&
+                                conv_bias->ne[1] == 1 &&
+                                conv_bias->ne[2] == x_direct->ne[2] &&
+                                (conv_bias->ne[3] == 1 || conv_bias->ne[3] == x_direct->ne[3]);
+                            if (bias_1d || bias_4d)
+                            {
+                                bias_direct = conv_bias;
+                                if (bias_direct->type != x_direct->type)
+                                {
+                                    bias_direct = ggml_cast(ctx, bias_direct, x_direct->type);
+                                }
+                            }
+                        }
+
+                        if (bias_direct != nullptr)
+                        {
+                            y = ggml_conv_2d_dw_direct_bias(ctx, w_direct, x_direct, bias_direct, s0, s1, p0, p1, d0, d1);
+                            fused_conv_bias = true;
+                        }
+                        else
+                        {
+                            y = ggml_conv_2d_dw_direct(ctx, w_direct, x_direct, s0, s1, p0, p1, d0, d1);
+                        }
                     }
                     else
                     {
                         y = ggml_conv_2d_dw(ctx, w, x, s0, s1, p0, p1, d0, d1);
                     }
                 }
-                if (node.inputs.size() >= 3)
+                if (node.inputs.size() >= 3 && !fused_conv_bias)
                 {
                     ggml_tensor *b = values.at(node.inputs[2]);
                     ggml_tensor *b_for_add = b;
