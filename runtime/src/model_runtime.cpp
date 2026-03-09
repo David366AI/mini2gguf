@@ -1730,10 +1730,6 @@ namespace mini2gguf
                         }
 
                         ggml_tensor *x_direct = x;
-                        if (x_direct->type != GGML_TYPE_F32)
-                        {
-                            x_direct = ggml_cast(ctx, x_direct, GGML_TYPE_F32);
-                        }
 
                         ggml_tensor *bias_direct = nullptr;
                         if (conv_bias != nullptr)
@@ -1789,15 +1785,6 @@ namespace mini2gguf
                     {
                         ggml_tensor *w_direct = w;
                         ggml_tensor *x_direct = x;
-
-                        if (w_direct->type != GGML_TYPE_F32)
-                        {
-                            w_direct = ggml_cast(ctx, w_direct, GGML_TYPE_F32);
-                        }
-                        if (x_direct->type != GGML_TYPE_F32)
-                        {
-                            x_direct = ggml_cast(ctx, x_direct, GGML_TYPE_F32);
-                        }
 
                         if (!ggml_is_contiguous(w_direct))
                         {
@@ -1935,6 +1922,7 @@ namespace mini2gguf
                 ggml_tensor *x = values.at(node.inputs[0]);
                 ggml_type to_type = GGML_TYPE_COUNT;
                 const bool skip_input_f16_cast = std::getenv("MINI2GGUF_SKIP_INPUT_F16_CAST") != nullptr;
+                const bool disable_auto_skip_input_f16_cast = env_flag_enabled("MINI2GGUF_DISABLE_AUTO_SKIP_INPUT_F16_CAST");
                 try
                 {
                     to_type = onnx_tensor_type_to_ggml(node.to);
@@ -1950,7 +1938,16 @@ namespace mini2gguf
                     continue;
                 }
 
-                if (skip_input_f16_cast &&
+                const ggml_backend_t backend = reinterpret_cast<ggml_backend_t>(backend_);
+                const ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+                const bool is_cpu_backend = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                const bool disable_cpu_conv_direct = env_flag_enabled("MINI2GGUF_DISABLE_CPU_CONV_DIRECT");
+                const bool auto_skip_input_f16_cast =
+                    !disable_auto_skip_input_f16_cast &&
+                    is_cpu_backend &&
+                    !disable_cpu_conv_direct;
+
+                if ((skip_input_f16_cast || auto_skip_input_f16_cast) &&
                     node.name == "graph_input_cast0" &&
                     (to_type == GGML_TYPE_F16 || to_type == GGML_TYPE_BF16))
                 {

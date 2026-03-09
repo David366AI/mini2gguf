@@ -39,3 +39,33 @@
 
 # debug information files
 *.dwo
+
+# Model assets (keep folder structure and docs only)
+assets/models/**
+!assets/models/
+!assets/models/README.md
+!assets/models/**/
+!assets/models/**/.gitkeep
+
+# IDE / editor
+.vscode/
+
+# Python bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# CMake and local build trees
+build*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/Makefile
+**/compile_commands.json
+
+# Local profiling and debug artifacts
+perf.data
+perf.data.*
+predictions_dynamic.jpg
