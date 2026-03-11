@@ -14,7 +14,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <functional>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -952,18 +954,88 @@ namespace mini2gguf
         backend_name_.clear();
         backend_device_name_.clear();
 
-        const std::string graph_path = model_dir + "/" + model_name + "_graph.json";
-        const std::string weights_path = model_dir + "/" + model_name + "_weights.gguf";
+        auto ends_with = [](const std::string &value, const std::string &suffix)
+        {
+            return value.size() >= suffix.size() &&
+                   value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
 
-        if (!load_graph_json(graph_path))
+        std::string stem = model_name;
+        std::vector<std::string> weights_candidates;
+        if (ends_with(model_name, ".gguf"))
         {
-            return false;
+            weights_candidates.push_back(model_dir + "/" + model_name);
+            stem = model_name.substr(0, model_name.size() - std::string(".gguf").size());
         }
-        if (!load_weights_gguf(weights_path))
+        else
         {
-            const std::string error = last_error_;
+            weights_candidates.push_back(model_dir + "/" + model_name + ".gguf");
+            weights_candidates.push_back(model_dir + "/" + model_name + "_weights.gguf");
+        }
+        if (ends_with(stem, "_weights"))
+        {
+            stem = stem.substr(0, stem.size() - std::string("_weights").size());
+        }
+
+        std::string weights_error;
+        bool weights_loaded = false;
+        for (size_t i = 0; i < weights_candidates.size(); ++i)
+        {
+            if (load_weights_gguf(weights_candidates[i]))
+            {
+                weights_loaded = true;
+                break;
+            }
+            weights_error = last_error_;
+            if (i + 1 < weights_candidates.size())
+            {
+                unload();
+                model_dir_ = model_dir;
+                model_name_ = model_name;
+                backend_name_.clear();
+                backend_device_name_.clear();
+            }
+        }
+        if (!weights_loaded)
+        {
             unload();
-            return set_error(error);
+            return set_error(weights_error.empty() ? "failed to load gguf" : weights_error);
+        }
+
+        const auto graph_meta_it = model_metadata_.find("model.graph");
+        const bool has_embedded_graph = graph_meta_it != model_metadata_.end() && !graph_meta_it->second.empty();
+        if (has_embedded_graph)
+        {
+            if (!load_graph_json_text(graph_meta_it->second, "gguf metadata key model.graph"))
+            {
+                const std::string error = last_error_;
+                unload();
+                return set_error(error);
+            }
+        }
+        else
+        {
+            std::vector<std::string> graph_candidates;
+            graph_candidates.push_back(model_dir + "/" + stem + ".json");
+            graph_candidates.push_back(model_dir + "/" + stem + "_graph.json");
+
+            std::string graph_error;
+            bool graph_loaded = false;
+            for (const std::string &graph_path : graph_candidates)
+            {
+                if (load_graph_json(graph_path))
+                {
+                    graph_loaded = true;
+                    break;
+                }
+                graph_error = last_error_;
+            }
+            if (!graph_loaded)
+            {
+                const std::string error = graph_error;
+                unload();
+                return set_error(error);
+            }
         }
         if (!build_compute_graph())
         {
@@ -1036,137 +1108,141 @@ namespace mini2gguf
 
         std::stringstream buffer;
         buffer << file.rdbuf();
+        const std::string graph_json = buffer.str();
+        std::stringstream().swap(buffer);
 
+        return load_graph_json_text(graph_json, graph_path);
+    }
+
+    bool DynamicModel::load_graph_json_text(const std::string &graph_json, const std::string &source_name)
+    {
+        JsonValue root;
+        try
         {
-            JsonValue root;
-            try
-            {
-                root = JsonParser(buffer.str()).parse();
-            }
-            catch (const std::exception &e)
-            {
-                return set_error(std::string("failed to parse graph json: ") + e.what());
-            }
+            root = JsonParser(graph_json).parse();
+        }
+        catch (const std::exception &e)
+        {
+            return set_error("failed to parse graph json (" + source_name + "): " + e.what());
+        }
 
-            model_metadata_.clear();
-            const JsonValue *model_metadata = find_obj_key(root, "model_metadata");
-            if (model_metadata != nullptr && model_metadata->type == JsonValue::Type::Object)
+        const JsonValue *model_metadata = find_obj_key(root, "model_metadata");
+        if (model_metadata != nullptr && model_metadata->type == JsonValue::Type::Object)
+        {
+            for (const auto &entry : model_metadata->object)
             {
-                for (const auto &entry : model_metadata->object)
-                {
-                    std::string value;
-                    if (!json_scalar_to_string(entry.second, value))
-                    {
-                        continue;
-                    }
-                    model_metadata_[entry.first] = value;
-                }
-            }
-
-            const JsonValue *graph = find_obj_key(root, "graph");
-            if (graph == nullptr || graph->type != JsonValue::Type::Object)
-            {
-                return set_error("graph json missing graph object");
-            }
-
-            auto parse_tensor_infos = [](const JsonValue *array_ptr)
-            {
-                std::vector<TensorInfo> result;
-                if (array_ptr == nullptr || array_ptr->type != JsonValue::Type::Array)
-                {
-                    return result;
-                }
-                for (const JsonValue &item : array_ptr->array)
-                {
-                    if (item.type != JsonValue::Type::Object)
-                    {
-                        continue;
-                    }
-                    TensorInfo info;
-                    info.name = get_string(item, "name", "");
-                    info.data_type = get_string(item, "data_type", "");
-                    info.dims = get_i64_array(item, "dims");
-                    result.push_back(std::move(info));
-                }
-                return result;
-            };
-
-            graph_inputs_ = parse_tensor_infos(find_obj_key(*graph, "inputs"));
-            graph_outputs_ = parse_tensor_infos(find_obj_key(*graph, "outputs"));
-            graph_initializers_ = parse_tensor_infos(find_obj_key(*graph, "initializers"));
-
-            tensor_rank_by_name_.clear();
-            auto register_tensor_rank = [&](const std::vector<TensorInfo> &infos)
-            {
-                for (const TensorInfo &info : infos)
-                {
-                    if (info.name.empty())
-                    {
-                        continue;
-                    }
-                    tensor_rank_by_name_[info.name] = static_cast<int>(info.dims.size());
-                }
-            };
-            register_tensor_rank(graph_inputs_);
-            register_tensor_rank(graph_outputs_);
-            register_tensor_rank(graph_initializers_);
-            register_tensor_rank(parse_tensor_infos(find_obj_key(*graph, "value_info")));
-
-            nodes_.clear();
-            const JsonValue *nodes_value = find_obj_key(*graph, "nodes");
-            if (nodes_value == nullptr || nodes_value->type != JsonValue::Type::Array)
-            {
-                return set_error("graph json missing nodes array");
-            }
-
-            nodes_.reserve(nodes_value->array.size());
-            for (const JsonValue &node_json : nodes_value->array)
-            {
-                if (node_json.type != JsonValue::Type::Object)
+                std::string value;
+                if (!json_scalar_to_string(entry.second, value))
                 {
                     continue;
                 }
-
-                NodeDef node;
-                node.name = get_string(node_json, "name", "");
-                node.op_type = get_string(node_json, "op_type", "");
-                node.inputs = get_string_array(node_json, "inputs");
-                node.outputs = get_string_array(node_json, "outputs");
-
-                const JsonValue *attrs = find_obj_key(node_json, "attributes");
-                if (attrs != nullptr && attrs->type == JsonValue::Type::Object)
-                {
-                    node.axis = static_cast<int>(get_i64(*attrs, "axis", 0));
-                    node.axes = get_i64_array(*attrs, "axes");
-                    node.keepdims = static_cast<int>(get_i64(*attrs, "keepdims", 1));
-                    node.split = get_i64_array(*attrs, "split");
-                    node.perm = to_i32_vec(get_i64_array(*attrs, "perm"));
-                    node.strides = to_i32_vec(get_i64_array(*attrs, "strides"));
-                    node.dilations = to_i32_vec(get_i64_array(*attrs, "dilations"));
-                    node.pads = to_i32_vec(get_i64_array(*attrs, "pads"));
-                    node.kernel_shape = to_i32_vec(get_i64_array(*attrs, "kernel_shape"));
-                    node.auto_pad = get_string(*attrs, "auto_pad", "");
-                    node.group = static_cast<int>(get_i64(*attrs, "group", 1));
-                    node.alpha = static_cast<float>(get_f64(*attrs, "alpha", 0.01));
-                    node.epsilon = static_cast<float>(get_f64(*attrs, "epsilon", 1e-5));
-                    node.momentum = static_cast<float>(get_f64(*attrs, "momentum", 0.9));
-                    node.to = static_cast<int>(get_i64(*attrs, "to", 0));
-                    node.largest = static_cast<int>(get_i64(*attrs, "largest", 1));
-                    node.sorted = static_cast<int>(get_i64(*attrs, "sorted", 1));
-                    node.fmod = static_cast<int>(get_i64(*attrs, "fmod", 0));
-
-                    const JsonValue *value = find_obj_key(*attrs, "value");
-                    if (value != nullptr && value->type == JsonValue::Type::Object)
-                    {
-                        node.const_value_name = get_string(*value, "name", "");
-                    }
-                }
-
-                nodes_.push_back(std::move(node));
+                model_metadata_[entry.first] = value;
             }
         }
 
-        std::stringstream().swap(buffer);
+        const JsonValue *graph = find_obj_key(root, "graph");
+        if (graph == nullptr || graph->type != JsonValue::Type::Object)
+        {
+            return set_error("graph json missing graph object (" + source_name + ")");
+        }
+
+        auto parse_tensor_infos = [](const JsonValue *array_ptr)
+        {
+            std::vector<TensorInfo> result;
+            if (array_ptr == nullptr || array_ptr->type != JsonValue::Type::Array)
+            {
+                return result;
+            }
+            for (const JsonValue &item : array_ptr->array)
+            {
+                if (item.type != JsonValue::Type::Object)
+                {
+                    continue;
+                }
+                TensorInfo info;
+                info.name = get_string(item, "name", "");
+                info.data_type = get_string(item, "data_type", "");
+                info.dims = get_i64_array(item, "dims");
+                result.push_back(std::move(info));
+            }
+            return result;
+        };
+
+        graph_inputs_ = parse_tensor_infos(find_obj_key(*graph, "inputs"));
+        graph_outputs_ = parse_tensor_infos(find_obj_key(*graph, "outputs"));
+        graph_initializers_ = parse_tensor_infos(find_obj_key(*graph, "initializers"));
+
+        tensor_rank_by_name_.clear();
+        auto register_tensor_rank = [&](const std::vector<TensorInfo> &infos)
+        {
+            for (const TensorInfo &info : infos)
+            {
+                if (info.name.empty())
+                {
+                    continue;
+                }
+                tensor_rank_by_name_[info.name] = static_cast<int>(info.dims.size());
+            }
+        };
+        register_tensor_rank(graph_inputs_);
+        register_tensor_rank(graph_outputs_);
+        register_tensor_rank(graph_initializers_);
+        register_tensor_rank(parse_tensor_infos(find_obj_key(*graph, "value_info")));
+
+        nodes_.clear();
+        const JsonValue *nodes_value = find_obj_key(*graph, "nodes");
+        if (nodes_value == nullptr || nodes_value->type != JsonValue::Type::Array)
+        {
+            return set_error("graph json missing nodes array (" + source_name + ")");
+        }
+
+        nodes_.reserve(nodes_value->array.size());
+        for (const JsonValue &node_json : nodes_value->array)
+        {
+            if (node_json.type != JsonValue::Type::Object)
+            {
+                continue;
+            }
+
+            NodeDef node;
+            node.name = get_string(node_json, "name", "");
+            node.op_type = get_string(node_json, "op_type", "");
+            node.inputs = get_string_array(node_json, "inputs");
+            node.outputs = get_string_array(node_json, "outputs");
+
+            const JsonValue *attrs = find_obj_key(node_json, "attributes");
+            if (attrs != nullptr && attrs->type == JsonValue::Type::Object)
+            {
+                node.axis = static_cast<int>(get_i64(*attrs, "axis", 0));
+                node.axes = get_i64_array(*attrs, "axes");
+                node.keepdims = static_cast<int>(get_i64(*attrs, "keepdims", 1));
+                node.split = get_i64_array(*attrs, "split");
+                node.perm = to_i32_vec(get_i64_array(*attrs, "perm"));
+                node.strides = to_i32_vec(get_i64_array(*attrs, "strides"));
+                node.dilations = to_i32_vec(get_i64_array(*attrs, "dilations"));
+                node.pads = to_i32_vec(get_i64_array(*attrs, "pads"));
+                node.kernel_shape = to_i32_vec(get_i64_array(*attrs, "kernel_shape"));
+                node.auto_pad = get_string(*attrs, "auto_pad", "");
+                node.group = static_cast<int>(get_i64(*attrs, "group", 1));
+                node.alpha = static_cast<float>(get_f64(*attrs, "alpha", 0.01));
+                node.epsilon = static_cast<float>(get_f64(*attrs, "epsilon", 1e-5));
+                node.momentum = static_cast<float>(get_f64(*attrs, "momentum", 0.9));
+                node.to = static_cast<int>(get_i64(*attrs, "to", 0));
+                node.largest = static_cast<int>(get_i64(*attrs, "largest", 1));
+                node.sorted = static_cast<int>(get_i64(*attrs, "sorted", 1));
+                node.fmod = static_cast<int>(get_i64(*attrs, "fmod", 0));
+                node.ceil_mode = static_cast<int>(get_i64(*attrs, "ceil_mode", 0));
+                node.count_include_pad = static_cast<int>(get_i64(*attrs, "count_include_pad", 0));
+
+                const JsonValue *value = find_obj_key(*attrs, "value");
+                if (value != nullptr && value->type == JsonValue::Type::Object)
+                {
+                    node.const_value_name = get_string(*value, "name", "");
+                }
+            }
+
+            nodes_.push_back(std::move(node));
+        }
 
         return true;
     }
@@ -1373,9 +1449,11 @@ namespace mini2gguf
         }
 
         const TensorInfo &input_info = graph_inputs_.front();
-        const int graph_size_hint = std::max<int>(GGML_DEFAULT_GRAPH_SIZE, static_cast<int>(nodes_.size() * 8 + 256));
+        const int graph_size_hint = std::max<int>(GGML_DEFAULT_GRAPH_SIZE, static_cast<int>(nodes_.size() * 16 + 2048));
+        // Keep enough tensor slots for graph nodes + views/casts/cont materializations.
+        const int tensor_slots_hint = std::max<int>(graph_size_hint * 2, static_cast<int>(nodes_.size() * 24 + 4096));
         ggml_init_params compute_params = {
-            static_cast<size_t>(ggml_tensor_overhead() * graph_size_hint + ggml_graph_overhead()),
+            static_cast<size_t>(ggml_tensor_overhead() * tensor_slots_hint + ggml_graph_overhead_custom(graph_size_hint, false)),
             nullptr,
             true,
         };
@@ -1661,8 +1739,11 @@ namespace mini2gguf
                 ggml_tensor *x = values.at(node.inputs[0]);
                 ggml_tensor *w = values.at(node.inputs[1]);
                 const bool force_conv_f32 = std::getenv("MINI2GGUF_FORCE_CONV_F32") != nullptr;
+                const bool force_dfl_conv_f32 =
+                    env_flag_enabled("MINI2GGUF_FORCE_DFL_CONV_F32") &&
+                    node.name.find("dfl/conv/Conv") != std::string::npos;
 
-                if (force_conv_f32 && w->type == GGML_TYPE_F16)
+                if ((force_conv_f32 || force_dfl_conv_f32) && w->type == GGML_TYPE_F16)
                 {
                     w = ggml_cast(ctx, w, GGML_TYPE_F32);
                     if (x->type == GGML_TYPE_F16)
@@ -1720,6 +1801,19 @@ namespace mini2gguf
                     const bool weight_type_ok = w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32;
                     const bool input_type_ok = x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32;
                     const bool can_use_direct = !disable_cpu_conv_direct && is_cpu_backend && weight_type_ok && input_type_ok;
+                    const bool debug_conv_direct = env_flag_enabled("MINI2GGUF_DEBUG_CONV_DIRECT");
+                    if (debug_conv_direct && node.name.find("dfl/conv/Conv") != std::string::npos)
+                    {
+                        std::cout << "conv-direct debug: node=" << node.name
+                                  << " can_use_direct=" << (can_use_direct ? 1 : 0)
+                                  << " w.type=" << ggml_type_name(w->type)
+                                  << " x.type=" << ggml_type_name(x->type)
+                                  << " x.contig=" << (ggml_is_contiguous(x) ? 1 : 0)
+                                  << " x.contig_ch=" << (ggml_is_contiguous_channels(x) ? 1 : 0)
+                                  << " x.ne=[" << x->ne[0] << "," << x->ne[1] << "," << x->ne[2] << "," << x->ne[3] << "]"
+                                  << " x.nb=[" << x->nb[0] << "," << x->nb[1] << "," << x->nb[2] << "," << x->nb[3] << "]"
+                                  << std::endl;
+                    }
 
                     if (can_use_direct)
                     {
@@ -1730,6 +1824,19 @@ namespace mini2gguf
                         }
 
                         ggml_tensor *x_direct = x;
+                        if (!ggml_is_contiguous(x_direct))
+                        {
+                            x_direct = ggml_cont(ctx, x_direct);
+                        }
+                        if (debug_conv_direct && node.name.find("dfl/conv/Conv") != std::string::npos)
+                        {
+                            std::cout << "conv-direct debug: node=" << node.name
+                                      << " x_direct.contig=" << (ggml_is_contiguous(x_direct) ? 1 : 0)
+                                      << " x_direct.contig_ch=" << (ggml_is_contiguous_channels(x_direct) ? 1 : 0)
+                                      << " x_direct.ne=[" << x_direct->ne[0] << "," << x_direct->ne[1] << "," << x_direct->ne[2] << "," << x_direct->ne[3] << "]"
+                                      << " x_direct.nb=[" << x_direct->nb[0] << "," << x_direct->nb[1] << "," << x_direct->nb[2] << "," << x_direct->nb[3] << "]"
+                                      << std::endl;
+                        }
 
                         ggml_tensor *bias_direct = nullptr;
                         if (conv_bias != nullptr)
@@ -1762,7 +1869,12 @@ namespace mini2gguf
                     }
                     else
                     {
-                        y = ggml_conv_2d(ctx, w, x, s0, s1, p0, p1, d0, d1);
+                        ggml_tensor *x_conv = x;
+                        if (!ggml_is_contiguous(x_conv))
+                        {
+                            x_conv = ggml_cont(ctx, x_conv);
+                        }
+                        y = ggml_conv_2d(ctx, w, x_conv, s0, s1, p0, p1, d0, d1);
                     }
                 }
                 else
@@ -1826,7 +1938,12 @@ namespace mini2gguf
                     }
                     else
                     {
-                        y = ggml_conv_2d_dw(ctx, w, x, s0, s1, p0, p1, d0, d1);
+                        ggml_tensor *x_conv = x;
+                        if (!ggml_is_contiguous(x_conv) && !ggml_is_contiguous_channels(x_conv))
+                        {
+                            x_conv = ggml_cont(ctx, x_conv);
+                        }
+                        y = ggml_conv_2d_dw(ctx, w, x_conv, s0, s1, p0, p1, d0, d1);
                     }
                 }
                 if (node.inputs.size() >= 3 && !fused_conv_bias)
@@ -1922,7 +2039,6 @@ namespace mini2gguf
                 ggml_tensor *x = values.at(node.inputs[0]);
                 ggml_type to_type = GGML_TYPE_COUNT;
                 const bool skip_input_f16_cast = std::getenv("MINI2GGUF_SKIP_INPUT_F16_CAST") != nullptr;
-                const bool disable_auto_skip_input_f16_cast = env_flag_enabled("MINI2GGUF_DISABLE_AUTO_SKIP_INPUT_F16_CAST");
                 try
                 {
                     to_type = onnx_tensor_type_to_ggml(node.to);
@@ -1938,16 +2054,7 @@ namespace mini2gguf
                     continue;
                 }
 
-                const ggml_backend_t backend = reinterpret_cast<ggml_backend_t>(backend_);
-                const ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
-                const bool is_cpu_backend = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-                const bool disable_cpu_conv_direct = env_flag_enabled("MINI2GGUF_DISABLE_CPU_CONV_DIRECT");
-                const bool auto_skip_input_f16_cast =
-                    !disable_auto_skip_input_f16_cast &&
-                    is_cpu_backend &&
-                    !disable_cpu_conv_direct;
-
-                if ((skip_input_f16_cast || auto_skip_input_f16_cast) &&
+                if (skip_input_f16_cast &&
                     node.name == "graph_input_cast0" &&
                     (to_type == GGML_TYPE_F16 || to_type == GGML_TYPE_BF16))
                 {
@@ -2055,6 +2162,7 @@ namespace mini2gguf
             {
                 ggml_tensor *a = values.at(node.inputs[0]);
                 ggml_tensor *b = values.at(node.inputs[1]);
+                const bool force_div_f32 = env_flag_enabled("MINI2GGUF_FORCE_DIV_F32");
 
                 if (a->type == GGML_TYPE_I32)
                 {
@@ -2080,7 +2188,7 @@ namespace mini2gguf
                     continue;
                 }
 
-                if (a->type != b->type)
+                if (force_div_f32 || a->type != b->type)
                 {
                     a = ggml_cast(ctx, a, GGML_TYPE_F32);
                     b = ggml_cast(ctx, b, GGML_TYPE_F32);
@@ -2210,6 +2318,18 @@ namespace mini2gguf
                 {
                     rhs = ggml_cont(ctx, rhs);
                 }
+                const bool force_matmul_f32 = env_flag_enabled("MINI2GGUF_FORCE_MATMUL_F32");
+                if (force_matmul_f32)
+                {
+                    if (lhs->type == GGML_TYPE_F16)
+                    {
+                        lhs = ggml_cast(ctx, lhs, GGML_TYPE_F32);
+                    }
+                    if (rhs->type == GGML_TYPE_F16)
+                    {
+                        rhs = ggml_cast(ctx, rhs, GGML_TYPE_F32);
+                    }
+                }
 
                 ggml_tensor *y = ggml_mul_mat(ctx, lhs, rhs);
                 values[node.outputs[0]] = y;
@@ -2226,37 +2346,58 @@ namespace mini2gguf
                     input_rank = rit->second;
                 }
                 const int axis_ggml = map_onnx_axis_to_ggml(node.axis, input_rank);
+                if (env_flag_enabled("MINI2GGUF_DEBUG_SOFTMAX"))
+                {
+                    std::cout << "softmax debug: node=" << node.name
+                              << " axis_onnx=" << node.axis
+                              << " input_rank=" << input_rank
+                              << " axis_ggml=" << axis_ggml
+                              << " x.ne=[" << x->ne[0] << "," << x->ne[1] << "," << x->ne[2] << "," << x->ne[3] << "]"
+                              << std::endl;
+                }
 
                 ggml_tensor *x_soft = x;
-                int perm[4] = {0, 1, 2, 3};
+                int to_dst[4] = {0, 1, 2, 3};
                 int inv_perm[4] = {0, 1, 2, 3};
                 if (axis_ggml != 0)
                 {
-                    int next = 1;
-                    perm[0] = axis_ggml;
+                    // ggml_permute args are "source axis -> destination axis".
+                    // Move source axis `axis_ggml` to destination dim0.
+                    int next_dst = 1;
+                    to_dst[axis_ggml] = 0;
                     for (int i = 0; i < 4; ++i)
                     {
                         if (i != axis_ggml)
                         {
-                            perm[next++] = i;
+                            to_dst[i] = next_dst++;
                         }
                     }
+                    // Inverse mapping for restoring original layout after softmax.
                     for (int i = 0; i < 4; ++i)
                     {
-                        inv_perm[perm[i]] = i;
+                        inv_perm[to_dst[i]] = i;
                     }
-                    x_soft = ggml_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
+                    x_soft = ggml_permute(ctx, x, to_dst[0], to_dst[1], to_dst[2], to_dst[3]);
                 }
 
                 if (!ggml_is_contiguous(x_soft))
                 {
                     x_soft = ggml_cont(ctx, x_soft);
                 }
+                const bool force_softmax_f32 = env_flag_enabled("MINI2GGUF_FORCE_SOFTMAX_F32");
+                if (force_softmax_f32 && x_soft->type == GGML_TYPE_F16)
+                {
+                    x_soft = ggml_cast(ctx, x_soft, GGML_TYPE_F32);
+                }
 
                 ggml_tensor *y = ggml_soft_max(ctx, x_soft);
                 if (axis_ggml != 0)
                 {
                     y = ggml_permute(ctx, y, inv_perm[0], inv_perm[1], inv_perm[2], inv_perm[3]);
+                }
+                if (!ggml_is_contiguous(y) && !ggml_is_contiguous_channels(y))
+                {
+                    y = ggml_cont(ctx, y);
                 }
                 values[node.outputs[0]] = y;
                 continue;
@@ -2298,6 +2439,18 @@ namespace mini2gguf
                 }
                 const int axis_ggml = map_onnx_axis_to_ggml(static_cast<int>(axes[0]), input_rank);
                 const int64_t dim = x->ne[axis_ggml];
+                if (env_flag_enabled("MINI2GGUF_DEBUG_SLICE"))
+                {
+                    std::cout << "slice debug: node=" << node.name
+                              << " input=" << node.inputs[0]
+                              << " input_rank=" << input_rank
+                              << " axis_onnx=" << axes[0]
+                              << " axis_ggml=" << axis_ggml
+                              << " x.ne=[" << x->ne[0] << "," << x->ne[1] << "," << x->ne[2] << "," << x->ne[3] << "]"
+                              << " start=" << starts[0]
+                              << " end=" << ends[0]
+                              << std::endl;
+                }
 
                 int64_t start = starts[0] < 0 ? starts[0] + dim : starts[0];
                 int64_t end = ends[0] < 0 ? ends[0] + dim : ends[0];
@@ -2612,7 +2765,7 @@ namespace mini2gguf
                 continue;
             }
 
-            if (node.op_type == "MaxPool")
+            if (node.op_type == "MaxPool" || node.op_type == "AveragePool")
             {
                 ggml_tensor *x = values.at(node.inputs[0]);
                 const std::vector<int> kernel = node.kernel_shape.empty() ? std::vector<int>{2, 2} : node.kernel_shape;
@@ -2634,7 +2787,26 @@ namespace mini2gguf
                     p0 = static_cast<float>(total_pad_w) * 0.5f;
                     p1 = static_cast<float>(total_pad_h) * 0.5f;
                 }
-                values[node.outputs[0]] = ggml_pool_2d(ctx, x, GGML_OP_POOL_MAX, k0, k1, s0, s1, p0, p1);
+
+                if (node.ceil_mode != 0)
+                {
+                    return fail_with_cleanup(node.op_type + " ceil_mode=1 is not supported: " + node.name);
+                }
+
+                enum ggml_op_pool pool_op = GGML_OP_POOL_MAX;
+                if (node.op_type == "AveragePool")
+                {
+                    const bool has_padding = p0 != 0.0f || p1 != 0.0f;
+                    // ggml 2D average-pool kernels divide by full kernel area (kh*kw),
+                    // i.e. include-pad semantics when padding exists.
+                    if (node.count_include_pad == 0 && has_padding)
+                    {
+                        return fail_with_cleanup("AveragePool count_include_pad=0 with padding is not supported: " + node.name);
+                    }
+                    pool_op = GGML_OP_POOL_AVG;
+                }
+
+                values[node.outputs[0]] = ggml_pool_2d(ctx, x, pool_op, k0, k1, s0, s1, p0, p1);
                 continue;
             }
 
@@ -3066,6 +3238,11 @@ namespace mini2gguf
             if (node.op_type == "Resize")
             {
                 ggml_tensor *x = values.at(node.inputs[0]);
+                const bool force_resize_f32 = env_flag_enabled("MINI2GGUF_FORCE_RESIZE_F32");
+                if (force_resize_f32 && x->type == GGML_TYPE_F16)
+                {
+                    x = ggml_cast(ctx, x, GGML_TYPE_F32);
+                }
                 std::vector<int64_t> target_sizes;
                 std::vector<float> scales;
 
@@ -3153,7 +3330,7 @@ namespace mini2gguf
             outputs.push_back(out);
         }
 
-        ggml_cgraph *gf = ggml_new_graph(ctx);
+        ggml_cgraph *gf = ggml_new_graph_custom(ctx, graph_size_hint, false);
         for (ggml_tensor *out : outputs)
         {
             ggml_build_forward_expand(gf, out);
@@ -3180,6 +3357,25 @@ namespace mini2gguf
         compute_allocr_ = reinterpret_cast<void *>(gallocr);
         input_tensor_ = input_tensor;
         output_tensors_ = std::move(outputs);
+
+        node_output_names_.clear();
+        node_output_tensors_.clear();
+        node_output_names_.reserve(nodes_.size());
+        node_output_tensors_.reserve(nodes_.size());
+        for (const NodeDef *node_ptr : execution_nodes)
+        {
+            const NodeDef &node = *node_ptr;
+            for (const std::string &out_name : node.outputs)
+            {
+                auto vit = values.find(out_name);
+                if (vit == values.end() || vit->second == nullptr)
+                {
+                    continue;
+                }
+                node_output_names_.push_back(out_name);
+                node_output_tensors_.push_back(vit->second);
+            }
+        }
 
         return true;
     }
@@ -3385,6 +3581,118 @@ namespace mini2gguf
         if (status != GGML_STATUS_SUCCESS)
         {
             return set_error("ggml backend graph compute failed");
+        }
+
+        const char *debug_node_stats = std::getenv("MINI2GGUF_DEBUG_NODE_STATS");
+        if (debug_node_stats != nullptr && debug_node_stats[0] != '\0')
+        {
+            std::vector<std::string> filters;
+            {
+                std::stringstream ss(debug_node_stats);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                {
+                    if (!token.empty())
+                    {
+                        filters.push_back(token);
+                    }
+                }
+            }
+
+            auto name_matches = [&](const std::string &name) -> bool
+            {
+                if (filters.empty())
+                {
+                    return true;
+                }
+                for (const std::string &f : filters)
+                {
+                    if (name.find(f) != std::string::npos)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            for (size_t i = 0; i < node_output_tensors_.size() && i < node_output_names_.size(); ++i)
+            {
+                const std::string &name = node_output_names_[i];
+                if (!name_matches(name))
+                {
+                    continue;
+                }
+
+                ggml_tensor *t = node_output_tensors_[i];
+                if (t == nullptr)
+                {
+                    continue;
+                }
+                if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16)
+                {
+                    continue;
+                }
+
+                const size_t n = static_cast<size_t>(ggml_nelements(t));
+                if (n == 0)
+                {
+                    std::cout << "node-stats " << name << ": empty" << std::endl;
+                    continue;
+                }
+
+                float min_v = std::numeric_limits<float>::infinity();
+                float max_v = -std::numeric_limits<float>::infinity();
+                double sum = 0.0;
+
+                if (t->type == GGML_TYPE_F32)
+                {
+                    std::vector<float> buf(n);
+                    if (t->buffer != nullptr)
+                    {
+                        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                    }
+                    else
+                    {
+                        std::memcpy(buf.data(), t->data, n * sizeof(float));
+                    }
+                    for (size_t k = 0; k < n; ++k)
+                    {
+                        const float v = buf[k];
+                        min_v = std::min(min_v, v);
+                        max_v = std::max(max_v, v);
+                        sum += v;
+                    }
+                }
+                else
+                {
+                    std::vector<ggml_fp16_t> buf(n);
+                    if (t->buffer != nullptr)
+                    {
+                        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(ggml_fp16_t));
+                    }
+                    else
+                    {
+                        std::memcpy(buf.data(), t->data, n * sizeof(ggml_fp16_t));
+                    }
+                    for (size_t k = 0; k < n; ++k)
+                    {
+                        const float v = ggml_fp16_to_fp32(buf[k]);
+                        min_v = std::min(min_v, v);
+                        max_v = std::max(max_v, v);
+                        sum += v;
+                    }
+                }
+
+                const double mean = sum / static_cast<double>(n);
+                std::cout << "node-stats " << name
+                          << ": type=" << (t->type == GGML_TYPE_F16 ? "f16" : "f32")
+                          << " ne=[" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "]"
+                          << " n=" << n
+                          << " min=" << min_v
+                          << " max=" << max_v
+                          << " mean=" << mean
+                          << std::endl;
+            }
         }
 
         outputs.clear();

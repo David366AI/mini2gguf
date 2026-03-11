@@ -1,73 +1,240 @@
 # mini2gguf
-mini2gguf is an open-source toolkit that converts compact AI models (PyTorch/ONNX) into GGUF weights plus a portable graph JSON, then runs dynamic inference on top of ggml. It focuses on lightweight vision workloads and provides a C/C++ runtime API for model initialization, multithreaded inference, optional post-processing, and executable examples.
 
-## Python IR (ONNX -> graph.json + weights.gguf)
+`mini2gguf` is a toolchain for converting compact vision models (mainly YOLO-family models) into GGUF, then running dynamic inference with ggml.
+It will support yolo classification, segment and CRNN inference in next several release.
+Current scope:
 
-Use the Python converter to generate both files in one pass:
+- Model conversion: `pt/onnx/cfg+weights -> gguf`
+- Runtime inference: dynamic graph execution + YOLO postprocessing (including NMS)
+- Example programs: detection demo and performance benchmark
 
-- `graph.json`: graph structure and tensor metadata
-- `weights.gguf`: initializer weights for runtime loading
+## 1. Project Goals
 
-CLI output naming:
+The project is designed to simplify model packaging and deployment:
 
-- Input `-i path/to/blank_16.onnx`
-- Output files: `blank_16_graph.json` and `blank_16_weights.gguf`
-- `-o` not set: outputs go to the same directory as input
-- `-o <dir>` set: outputs go to that directory
+1. Convert models into a unified GGUF format (graph JSON is embedded in `model.graph` by default)
+2. Run with one runtime across CPU/GPU backends
+3. Provide ready-to-run demo and benchmark binaries
 
-ggml compatibility in converter:
+Current backend support:
 
-- Rank-5 tensors are lowered to rank-4 by merging `H x W`
-- Related `Transpose` perms and axis-based attributes are rewritten accordingly
-- Rank `>= 6` tensors are rejected with an error
+- CPU
+- CUDA
+- Vulkan
 
-By default, `graph.json` is metadata-only (no initializer values), so weights stay in GGUF.
+## 2. Installation
 
-```bash
-conda run -n base python -m converter.python.onnx_to_gguf \
-	-i assets/models/yolo/raw/blank_16.onnx \
-	-o assets/models/yolo/converted
-```
+### 2.1 System Requirements
 
-This command writes:
+Recommended environment:
 
-- `assets/models/yolo/converted/blank_16_graph.json`
-- `assets/models/yolo/converted/blank_16_weights.gguf`
+- Linux
+- CMake >= 3.20
+- C/C++ compiler with C++17 support
+- Python 3.10+
 
-If `-o` is omitted:
+Backend-specific requirements:
 
-```bash
-conda run -n base python -m converter.python.onnx_to_gguf \
-	-i assets/models/yolo/raw/blank_16.onnx
-```
+- CPU: no extra dependencies
+- Vulkan: Vulkan loader/driver/development packages installed
+- CUDA: CUDA Toolkit (including `nvcc`) and a compatible NVIDIA driver
 
-Then outputs are created under `assets/models/yolo/raw/` with the same naming rule.
-
-Run unit tests:
+### 2.2 Python Dependencies (Converter)
+Python >= 3.12
 
 ```bash
-conda run -n base python -m unittest discover -s tests/unit -p "test_*.py"
+pip install -r requirements.txt
 ```
 
-## C++ Runtime (Dynamic Graph)
+If you want to use the official YOLOv5 export path (`--export-backend yolov5`), follow [third_party/README.md](third_party/README.md).
 
-Runtime does not hardcode class count or YOLO-specific output width. It uses `graph.json` tensor metadata at load time, so different ONNX-derived models can have different output shapes.
+## 3. Build (CPU / Vulkan / CUDA)
 
-Build with local `ggml/` clone:
+Top-level CMake options:
+
+- `GGML_VULKAN=ON`: enable Vulkan (passes through to ggml)
+- `GGML_CUDA=ON`: enable CUDA (passes through to ggml)
+
+### 3.1 CPU (default)
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
+cmake -S . -B build-cpu
+cmake --build build-cpu -j
 ```
 
-Run demo (loads `<model_name>_graph.json` + `<model_name>_weights.gguf`):
+### 3.2 Vulkan
 
 ```bash
-./build/examples/cpp/mini2gguf_infer_demo assets/models/yolo/converted blank_16
+cmake -S . -B build-vulkan -DGGML_VULKAN=ON
+cmake --build build-vulkan -j
 ```
 
-CPU runtime notes:
+### 3.3 CUDA
 
-- CPU direct conv path is enabled by default when available.
-- For CPU direct conv, runtime auto-skips `graph_input_cast0` (`F32->F16`) to avoid redundant `F32<->F16` conversion on the hot path.
-- Set `MINI2GGUF_DISABLE_AUTO_SKIP_INPUT_F16_CAST=1` to restore strict graph Cast behavior.
+```bash
+cmake -S . -B build-cuda -DGGML_CUDA=ON
+cmake --build build-cuda -j
+```
+
+Optional (set GPU architecture explicitly):
+
+```bash
+cmake -S . -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-cuda -j
+```
+
+## 4. Download Sample Models and Test Image
+
+The following commands download sample models and a test image:
+
+```bash
+mkdir -p assets/models/yolo
+mkdir -p assets/images
+
+# test image
+wget -O assets/images/dog.jpg https://raw.githubusercontent.com/pjreddie/darknet/master/data/dog.jpg
+
+# darknet models
+wget -O assets/models/yolo/yolov3-tiny.cfg https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3-tiny.cfg
+wget -O assets/models/yolo/yolov3-tiny.weights https://pjreddie.com/media/files/yolov3-tiny.weights
+wget -O assets/models/yolo/yolov4-tiny.cfg https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg
+wget -O assets/models/yolo/yolov4-tiny.weights https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights
+
+# ultralytics pt models
+wget -O assets/models/yolo/yolov5n.pt https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.pt
+wget -O assets/models/yolo/yolov8n.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n.pt
+wget -O assets/models/yolo/yolov9t.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov9t.pt
+wget -O assets/models/yolo/yolov10n.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov10n.pt
+wget -O assets/models/yolo/yolo11n.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11n.pt
+wget -O assets/models/yolo/yolo26n.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt
+```
+
+## 5. Model Conversion (PT / ONNX / Darknet)
+
+### 5.1 Darknet -> ONNX
+
+```bash
+python converter/darknet2onnx.py \
+  --cfg assets/models/yolo/yolov4-tiny.cfg \
+  --weights assets/models/yolo/yolov4-tiny.weights \
+  --output-path assets/models/yolo/yolov4-tiny.onnx
+
+for example:
+python converter/darknet2onnx.py -c ./assets/models/yolo/yolov3-tiny.cfg -w ./assets/models/yolo/yolov3-tiny.weights
+python converter/onnx2gguf.py -i ./assets/models/yolo/yolov3-tiny.onnx
+```
+
+### 5.2 ONNX -> GGUF
+
+```bash
+python converter/onnx2gguf.py \
+  -i assets/models/yolo/yolov4-tiny.onnx \
+  --model-family yolo
+```
+
+Notes:
+
+- Default output: `<stem>.gguf` (graph JSON embedded in `model.graph`)
+- `--split`: outputs `<stem>.json` + `<stem>.gguf` (graph and weights separated)
+
+### 5.3 PT -> GGUF (YOLO)
+
+Example (YOLOv26):
+
+```bash
+python converter/yolo2gguf.py \
+  -i assets/models/yolo/yolo26n.pt \
+  -v 26 \
+  -c detection
+
+for example:
+python converter/yolo2gguf.py -i ./assets/models/yolo/yolo26n.pt -v 26 -c detection  
+```
+
+Example (YOLOv5, using official YOLOv5 exporter):
+
+```bash
+python converter/yolo2gguf.py \
+  -i assets/models/yolo/yolov5n.pt \
+  -v 5 \
+  -c detection \
+  --export-backend yolov5 \
+  --yolov5-dir ./third_party/yolov5
+```
+
+If `--yolov5-dir` is not provided, the converter auto-searches:
+
+- `./yolov5`
+- `<repo>/third_party/yolov5`
+- `../yolov5`
+
+## 6. Run Demo (`yolo_demo`)
+
+YOLO detection demo:
+
+```bash
+./<build-dir>/examples/yolo_demo \
+  -m assets/models/yolo/yolo26n.gguf \
+  -i assets/images/dog.jpg \
+  -o predictions.jpg \
+  --conf 0.45 \
+  --iou 0.45 \
+  -a \
+  -b auto
+
+./build/examples/cpp/yolo_demo -m assets/models/yolo/yolov3-tiny.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
+./build/examples/cpp/yolo_demo -m assets/models/yolo/yolo26n.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
+```
+
+Arguments:
+
+- `-m, --model`: GGUF model path
+- `-i, --input`: input image
+- `-o, --output`: output image
+- `--conf / --iou`: confidence and IoU thresholds
+- `-a, --agnostic`: class-agnostic NMS
+- `-b, --backend`: `auto|cpu|gpu|vulkanN|cudaN`
+
+Examples:
+
+- Force CPU: `-b cpu`
+- Vulkan device 0: `-b vulkan0`
+- CUDA device 0: `-b cuda0`
+
+## 7. Benchmark (`infer_performance_test`)
+
+```bash
+./<build-dir>/examples/infer_performance_test \
+  -m assets/models/yolo/yolo26n.gguf \
+  -f 0.0 \
+  -b 20 \
+  -d auto
+```
+
+Arguments:
+
+- `-m, --model`: GGUF model path
+- `-f, --fill_value`: input fill value
+- `-b, --betch_iters`: benchmark iterations (typo kept for compatibility)
+- `--bench_iters`: alias of `--betch_iters`
+- `-d, --backend`: `auto|cpu|gpu|vulkanN|cudaN`
+
+## 8. Additional Notes
+
+### A. Runtime Backend Selection
+
+The runtime selects backend through environment variable `MINI2GGUF_BACKEND`.
+The demo/benchmark binaries set this variable automatically via `-b` / `-d`.
+
+### B. Metadata Recommendation
+
+`yolo_demo` relies on `model.family=yolo` and `model.version` for postprocess dispatch.
+If you convert ONNX manually, ensure metadata is set correctly (for example, `onnx2gguf.py --model-family yolo`).
+
+### C. Converter Entry Points
+
+- `converter/darknet2onnx.py`
+- `converter/onnx2gguf.py`
+- `converter/yolo2gguf.py`
+
+For full converter arguments, run `--help` on each script.

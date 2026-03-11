@@ -40,12 +40,6 @@
 # debug information files
 *.dwo
 
-# Model assets (keep folder structure and docs only)
-assets/models/**
-!assets/models/
-!assets/models/README.md
-!assets/models/**/
-!assets/models/**/.gitkeep
 
 # IDE / editor
 .vscode/
@@ -69,3 +63,5 @@ build*/
 perf.data
 perf.data.*
 predictions_dynamic.jpg
+
+ggml-local.bundle

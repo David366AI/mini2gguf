@@ -16,4 +16,4 @@ endif()
 
 add_subdirectory(ggml)
 add_subdirectory(runtime)
-add_subdirectory(examples/cpp)
+add_subdirectory(examples)

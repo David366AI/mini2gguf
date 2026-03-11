@@ -1297,7 +1297,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1314,11 +1314,31 @@ UseGgmlGemm1:;
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
                     size_t bs = ggml_blck_size(vec_dot_type);
+                    GGML_ASSERT(bs > 0);
+                    GGML_ASSERT(ne10 % bs == 0);
+
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+
+                    char * dst_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+                    if (src1->type == GGML_TYPE_F32) {
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (dst_row + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    } else {
+                        const ggml_fp16_t * src_row = (const ggml_fp16_t *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                        const int64_t nvals = (ne10_block_end - ne10_block_start) * (int64_t) bs;
+                        if (nvals > 0) {
+                            float * tmp_f32 = (float *) malloc((size_t) nvals * sizeof(float));
+                            GGML_ASSERT(tmp_f32 != NULL);
+                            const ggml_fp16_t * src_chunk = src_row + ne10_block_start*bs;
+                            for (int64_t k = 0; k < nvals; ++k) {
+                                tmp_f32[k] = GGML_CPU_FP16_TO_FP32(src_chunk[k]);
+                            }
+                            from_float(tmp_f32, dst_row + ne10_block_start*nbw0, nvals);
+                            free(tmp_f32);
+                        }
+                    }
                 }
             }
         }
@@ -1560,7 +1580,7 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1577,11 +1597,31 @@ static void ggml_compute_forward_mul_mat_id(
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
                     size_t bs = ggml_blck_size(vec_dot_type);
+                    GGML_ASSERT(bs > 0);
+                    GGML_ASSERT(ne10 % bs == 0);
+
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+
+                    char * dst_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+                    if (src1->type == GGML_TYPE_F32) {
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (dst_row + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    } else {
+                        const ggml_fp16_t * src_row = (const ggml_fp16_t *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                        const int64_t nvals = (ne10_block_end - ne10_block_start) * (int64_t) bs;
+                        if (nvals > 0) {
+                            float * tmp_f32 = (float *) malloc((size_t) nvals * sizeof(float));
+                            GGML_ASSERT(tmp_f32 != NULL);
+                            const ggml_fp16_t * src_chunk = src_row + ne10_block_start*bs;
+                            for (int64_t k = 0; k < nvals; ++k) {
+                                tmp_f32[k] = GGML_CPU_FP16_TO_FP32(src_chunk[k]);
+                            }
+                            from_float(tmp_f32, dst_row + ne10_block_start*nbw0, nvals);
+                            free(tmp_f32);
+                        }
+                    }
                 }
             }
         }

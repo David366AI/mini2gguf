@@ -71,6 +71,8 @@ public:
         int largest = 1;
         int sorted = 1;
         int fmod = 0;
+        int ceil_mode = 0;
+        int count_include_pad = 0;
 
         std::string const_value_name;
     };
@@ -84,6 +86,7 @@ public:
 private:
 
     bool load_graph_json(const std::string & graph_path);
+    bool load_graph_json_text(const std::string & graph_json, const std::string & source_name);
     bool load_weights_gguf(const std::string & weights_path);
     bool build_compute_graph();
 

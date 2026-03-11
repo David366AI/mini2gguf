@@ -1,0 +1,11 @@
+# Core converter dependencies
+numpy
+onnx
+gguf
+
+# PT -> ONNX export path (used by converter/yolo2gguf.py)
+torch
+ultralytics
+
+# Optional optimizer used by Ultralytics ONNX export
+onnxslim
