@@ -1,7 +1,8 @@
 # mini2gguf
 
-`mini2gguf` is a toolchain for converting compact vision models (mainly YOLO-family models) into GGUF, then running dynamic inference with ggml.
+`mini2gguf` is a toolchain for converting compact vision models (mainly YOLO-family models) into GGUF, then running dynamic inference with [ggml](https://github.com/ggml-org/ggml). 
 It will support yolo classification, segment and CRNN inference in next several release.
+
 Current scope:
 
 - Model conversion: `pt/onnx/cfg+weights -> gguf`
@@ -238,3 +239,8 @@ If you convert ONNX manually, ensure metadata is set correctly (for example, `on
 - `converter/yolo2gguf.py`
 
 For full converter arguments, run `--help` on each script.
+
+## 9. GGML change
+- Add OP support for GatherElements/ReduceMax/Gather for CPU/Vulkan/CUDA
+- Optimize Conv 2D because of performance for CPU backend 
+- Support Conv F16 completely
