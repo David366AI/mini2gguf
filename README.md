@@ -187,6 +187,10 @@ YOLO detection demo:
 ./build/examples/cpp/yolo_demo -m assets/models/yolo/yolo26n.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
 ```
 
+Result preview:
+
+![YOLO demo prediction result](assets/images/predictions.jpg)
+
 Arguments:
 
 - `-m, --model`: GGUF model path
