@@ -41,7 +41,7 @@ Backend-specific requirements:
 - CUDA: CUDA Toolkit (including `nvcc`) and a compatible NVIDIA driver
 
 ### 2.2 Python Dependencies (Converter)
-Python >= 3.12
+Python >= 3.10
 
 ```bash
 pip install -r requirements.txt
