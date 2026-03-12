@@ -171,6 +171,7 @@ If `--yolov5-dir` is not provided, the converter auto-searches:
 
 ## 6. Run Demo (`yolo_demo`)
 
+### 6.1 YOLO detection
 YOLO detection demo:
 
 ```bash
@@ -205,6 +206,21 @@ Examples:
 - Force CPU: `-b cpu`
 - Vulkan device 0: `-b vulkan0`
 - CUDA device 0: `-b cuda0`
+
+### 6.2 YOLO segmentation
+
+Converter pt to gguf
+```bash
+python converter/yolo2gguf.py -i ./assets/models/yolo/yolo26n-seg.pt -v 26 -c segmentation
+```
+
+Inference
+```bash
+./build/examples/yolo_demo -m assets/models/yolo/yolo26n-seg.gguf -i assets/images/dog.jpg -o assets/images/segment.jpg --conf 0.50 --iou 0.45
+```
+
+Result preview:
+![YOLO demo prediction result](assets/images/segment.jpg)
 
 ## 7. Benchmark (`infer_performance_test`)
 
