@@ -226,6 +226,26 @@ static void draw_detections(
                 bot = im.h - 1;
             }
 
+            if (!dets[static_cast<size_t>(i)].mask.empty() &&
+                dets[static_cast<size_t>(i)].mask_w == im.w &&
+                dets[static_cast<size_t>(i)].mask_h == im.h) {
+                const float alpha = 0.35f;
+                for (int y = top; y <= bot; ++y) {
+                    for (int x = left; x <= right; ++x) {
+                        const size_t midx = static_cast<size_t>(y) * static_cast<size_t>(im.w) + static_cast<size_t>(x);
+                        if (dets[static_cast<size_t>(i)].mask[midx] == 0) {
+                            continue;
+                        }
+                        const float r0 = im.get_pixel(x, y, 0);
+                        const float g0 = im.get_pixel(x, y, 1);
+                        const float b0 = im.get_pixel(x, y, 2);
+                        im.set_pixel(x, y, 0, r0 * (1.0f - alpha) + red * alpha);
+                        im.set_pixel(x, y, 1, g0 * (1.0f - alpha) + green * alpha);
+                        im.set_pixel(x, y, 2, b0 * (1.0f - alpha) + blue * alpha);
+                    }
+                }
+            }
+
             draw_box_width(im, left, top, right, bot, width, red, green, blue);
             yolo_image label = get_label(alphabet, labelstr, (im.h * .03f));
             draw_label(im, top + width, left, label, rgb);

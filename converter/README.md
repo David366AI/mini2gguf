@@ -103,6 +103,7 @@ Arguments:
 - `--export-half/--no-export-half`: PT->ONNX export precision toggle
 - `--weight-f16/--no-weight-f16`: GGUF weight cast toggle
 - `--split`: export `<stem>.json` separately instead of embedding graph JSON
+- `-keep-onnx, --keep-onnx`: keep intermediate ONNX files for PT input (default behavior removes them after successful conversion)
 
 Examples:
 

@@ -35,6 +35,27 @@ struct yolo_xyxy_candidate {
     int cls = -1;
 };
 
+struct yolo_xyxy_seg_candidate {
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float x2 = 0.0f;
+    float y2 = 0.0f;
+    float net_x1 = 0.0f;
+    float net_y1 = 0.0f;
+    float net_x2 = 0.0f;
+    float net_y2 = 0.0f;
+    float score = 0.0f;
+    int cls = -1;
+    std::vector<float> mask_coeff;
+};
+
+struct yolo_proto_layout {
+    int nm = 0;
+    int h = 0;
+    int w = 0;
+    bool channels_first = true;
+};
+
 static void activate_array(float * x, int n) {
     for (int i = 0; i < n; ++i) {
         x[i] = 1.0f / (1.0f + std::exp(-x[i]));
@@ -287,6 +308,138 @@ static float box_iou_xyxy(const yolo_xyxy_candidate & a, const yolo_xyxy_candida
     return inter / uni;
 }
 
+static float box_iou_xyxy(const yolo_xyxy_seg_candidate & a, const yolo_xyxy_seg_candidate & b) {
+    const float inter_x1 = std::max(a.x1, b.x1);
+    const float inter_y1 = std::max(a.y1, b.y1);
+    const float inter_x2 = std::min(a.x2, b.x2);
+    const float inter_y2 = std::min(a.y2, b.y2);
+    const float inter_w = std::max(0.0f, inter_x2 - inter_x1);
+    const float inter_h = std::max(0.0f, inter_y2 - inter_y1);
+    const float inter = inter_w * inter_h;
+    const float area_a = std::max(0.0f, a.x2 - a.x1) * std::max(0.0f, a.y2 - a.y1);
+    const float area_b = std::max(0.0f, b.x2 - b.x1) * std::max(0.0f, b.y2 - b.y1);
+    const float uni = area_a + area_b - inter;
+    if (uni <= 0.0f) {
+        return 0.0f;
+    }
+    return inter / uni;
+}
+
+static float sigmoidf(float x) {
+    if (x >= 0.0f) {
+        const float z = std::exp(-x);
+        return 1.0f / (1.0f + z);
+    }
+    const float z = std::exp(x);
+    return z / (1.0f + z);
+}
+
+static bool infer_yolo_seg_proto_layout(
+    const std::vector<float> & proto,
+    const std::vector<int64_t> & dims,
+    int expected_nm,
+    yolo_proto_layout & layout) {
+    layout = {};
+    if (proto.empty()) {
+        return false;
+    }
+
+    auto try_set = [&](int nm, int h, int w, bool channels_first) -> bool {
+        if (nm <= 0 || h <= 0 || w <= 0 || nm > 1024) {
+            return false;
+        }
+        const size_t expected = static_cast<size_t>(nm) * static_cast<size_t>(h) * static_cast<size_t>(w);
+        if (expected != proto.size()) {
+            return false;
+        }
+        if (expected_nm > 0 && nm != expected_nm) {
+            return false;
+        }
+        layout.nm = nm;
+        layout.h = h;
+        layout.w = w;
+        layout.channels_first = channels_first;
+        return true;
+    };
+
+    if (dims.size() == 4 && dims[0] == 1) {
+        if (try_set(static_cast<int>(dims[1]), static_cast<int>(dims[2]), static_cast<int>(dims[3]), true)) {
+            return true;
+        }
+        if (try_set(static_cast<int>(dims[3]), static_cast<int>(dims[1]), static_cast<int>(dims[2]), false)) {
+            return true;
+        }
+    }
+    if (dims.size() == 3) {
+        if (try_set(static_cast<int>(dims[0]), static_cast<int>(dims[1]), static_cast<int>(dims[2]), true)) {
+            return true;
+        }
+        if (try_set(static_cast<int>(dims[2]), static_cast<int>(dims[0]), static_cast<int>(dims[1]), false)) {
+            return true;
+        }
+    }
+
+    if (expected_nm > 0 && (proto.size() % static_cast<size_t>(expected_nm)) == 0) {
+        const int area = static_cast<int>(proto.size() / static_cast<size_t>(expected_nm));
+        int h = static_cast<int>(std::sqrt(static_cast<double>(area)));
+        if (h <= 0) {
+            h = 1;
+        }
+        while (h > 1 && (area % h) != 0) {
+            --h;
+        }
+        const int w = area / h;
+        if (try_set(expected_nm, h, w, true)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static float yolo_proto_value(
+    const std::vector<float> & proto,
+    const yolo_proto_layout & layout,
+    int c,
+    int y,
+    int x) {
+    if (layout.channels_first) {
+        const size_t idx = (static_cast<size_t>(c) * static_cast<size_t>(layout.h) + static_cast<size_t>(y)) * static_cast<size_t>(layout.w) + static_cast<size_t>(x);
+        return proto[idx];
+    }
+    const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(layout.w) + static_cast<size_t>(x)) * static_cast<size_t>(layout.nm) + static_cast<size_t>(c);
+    return proto[idx];
+}
+
+static float bilinear_sample_2d(
+    const std::vector<float> & image,
+    int w,
+    int h,
+    float x,
+    float y) {
+    if (w <= 0 || h <= 0 || image.empty()) {
+        return 0.0f;
+    }
+    x = clampf(x, 0.0f, static_cast<float>(w - 1));
+    y = clampf(y, 0.0f, static_cast<float>(h - 1));
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, w - 1);
+    const int y1 = std::min(y0 + 1, h - 1);
+    const float dx = x - static_cast<float>(x0);
+    const float dy = y - static_cast<float>(y0);
+
+    const float v00 = image[static_cast<size_t>(y0) * static_cast<size_t>(w) + static_cast<size_t>(x0)];
+    const float v01 = image[static_cast<size_t>(y0) * static_cast<size_t>(w) + static_cast<size_t>(x1)];
+    const float v10 = image[static_cast<size_t>(y1) * static_cast<size_t>(w) + static_cast<size_t>(x0)];
+    const float v11 = image[static_cast<size_t>(y1) * static_cast<size_t>(w) + static_cast<size_t>(x1)];
+
+    const float top = v00 + (v01 - v00) * dx;
+    const float bot = v10 + (v11 - v10) * dx;
+    return top + (bot - top) * dy;
+}
+
 static bool infer_yolo_layout(
     const std::vector<float> & pred,
     const std::vector<int64_t> & dims,
@@ -397,8 +550,62 @@ static bool infer_yolo_v5_layout(
     return infer_yolo_layout(pred, dims, 6, 85, false, attrs, boxes, attrs_first);
 }
 
+static void infer_yolo_v4_layer_config(
+    const std::vector<float> & pred,
+    const std::vector<int64_t> & dims,
+    int fallback_w,
+    int fallback_h,
+    int & out_w,
+    int & out_h,
+    int & out_classes) {
+    out_w = fallback_w;
+    out_h = fallback_h;
+    out_classes = 80;
+
+    auto try_set = [&](int w, int h) -> bool {
+        if (w <= 0 || h <= 0 || pred.empty()) {
+            return false;
+        }
+        const size_t area = static_cast<size_t>(w) * static_cast<size_t>(h);
+        if (area == 0 || (pred.size() % area) != 0) {
+            return false;
+        }
+        const size_t attrs_total = pred.size() / area;
+        if ((attrs_total % 3) != 0) {
+            return false;
+        }
+        const size_t attrs_per_anchor = attrs_total / 3;
+        if (attrs_per_anchor <= 5 || attrs_per_anchor > 4101) {
+            return false;
+        }
+        out_w = w;
+        out_h = h;
+        out_classes = static_cast<int>(attrs_per_anchor - 5);
+        return true;
+    };
+
+    if (!dims.empty()) {
+        std::vector<int64_t> positive_dims;
+        positive_dims.reserve(dims.size());
+        for (int64_t d : dims) {
+            if (d > 1) {
+                positive_dims.push_back(d);
+            }
+        }
+        if (positive_dims.size() >= 3) {
+            std::sort(positive_dims.begin(), positive_dims.end());
+            if (try_set(static_cast<int>(positive_dims[0]), static_cast<int>(positive_dims[1]))) {
+                return;
+            }
+        }
+    }
+
+    (void)try_set(fallback_w, fallback_h);
+}
+
 static bool postprocess_yolo_v4(
     const std::vector<std::vector<float>> & outputs,
+    const std::vector<DynamicModel::TensorInfo> & output_infos,
     const YoloPostprocessOptions & options,
     std::vector<YoloDetection> & detections,
     std::string & error) {
@@ -407,8 +614,44 @@ static bool postprocess_yolo_v4(
         return false;
     }
 
-    yolo_layer yolo16{80, {3, 4, 5}, {10, 14, 23, 27, 37, 58, 81, 82, 135, 169, 344, 319}, outputs[0], 13, 13};
-    yolo_layer yolo23{80, {0, 1, 2}, {10, 14, 23, 27, 37, 58, 81, 82, 135, 169, 344, 319}, outputs[1], 26, 26};
+    std::vector<int64_t> out0_dims;
+    std::vector<int64_t> out1_dims;
+    if (!output_infos.empty()) {
+        out0_dims = output_infos[0].dims;
+    }
+    if (output_infos.size() >= 2) {
+        out1_dims = output_infos[1].dims;
+    }
+
+    int out0_w = 13;
+    int out0_h = 13;
+    int out0_classes = 80;
+    int out1_w = 26;
+    int out1_h = 26;
+    int out1_classes = 80;
+    infer_yolo_v4_layer_config(outputs[0], out0_dims, 13, 13, out0_w, out0_h, out0_classes);
+    infer_yolo_v4_layer_config(outputs[1], out1_dims, 26, 26, out1_w, out1_h, out1_classes);
+    if (out0_classes != out1_classes) {
+        error = "YOLO <= v4 output class count mismatch between heads";
+        return false;
+    }
+
+    yolo_layer yolo16{
+        out0_classes,
+        {3, 4, 5},
+        {10, 14, 23, 27, 37, 58, 81, 82, 135, 169, 344, 319},
+        outputs[0],
+        out0_w,
+        out0_h,
+    };
+    yolo_layer yolo23{
+        out1_classes,
+        {0, 1, 2},
+        {10, 14, 23, 27, 37, 58, 81, 82, 135, 169, 344, 319},
+        outputs[1],
+        out1_w,
+        out1_h,
+    };
 
     apply_yolo(yolo16);
     apply_yolo(yolo23);
@@ -430,12 +673,13 @@ static bool postprocess_yolo_v4(
         options.net_w,
         options.net_h,
         options.conf_thres);
-    do_nms_sort(detections, 80, options.iou_thres, options.agnostic_nms);
+    do_nms_sort(detections, out0_classes, options.iou_thres, options.agnostic_nms);
     return true;
 }
 
 static bool postprocess_yolo_v26(
     const std::vector<std::vector<float>> & outputs,
+    const std::vector<DynamicModel::TensorInfo> & output_infos,
     const YoloPostprocessOptions & options,
     std::vector<YoloDetection> & detections,
     std::string & error) {
@@ -445,27 +689,134 @@ static bool postprocess_yolo_v26(
     }
 
     const std::vector<float> & pred = outputs[0];
-    if (pred.empty() || (pred.size() % 6) != 0) {
-        error = "YOLO output must be Kx6";
+    if (pred.empty()) {
+        error = "YOLO output[0] is empty";
         return false;
     }
 
-    constexpr int classes = 80;
-    const size_t k = pred.size() / 6;
+    std::vector<int64_t> dims;
+    if (!output_infos.empty()) {
+        dims = output_infos[0].dims;
+    }
+    int attrs = -1;
+    int num_boxes = -1;
+    bool attrs_first = false;
+    if (!infer_yolo_layout(pred, dims, 6, 6, false, attrs, num_boxes, attrs_first)) {
+        error = "YOLOv26/v10 output shape is not supported";
+        return false;
+    }
+    if (attrs < 6) {
+        error = "YOLOv26/v10 output attrs must be >= 6";
+        return false;
+    }
 
+    auto at_with_layout = [&](bool candidate_attrs_first, int box_idx, int attr_idx) -> float {
+        if (candidate_attrs_first) {
+            return pred[static_cast<size_t>(attr_idx) * static_cast<size_t>(num_boxes) + static_cast<size_t>(box_idx)];
+        }
+        return pred[static_cast<size_t>(box_idx) * static_cast<size_t>(attrs) + static_cast<size_t>(attr_idx)];
+    };
+
+    const bool seg_mode = attrs > 6;
+    const int coeff_count = attrs - 6;
+    const bool debug_parse = std::getenv("MINI2GGUF_DEBUG_YOLO26_PARSE") != nullptr;
+
+    const std::vector<float> * proto = nullptr;
+    yolo_proto_layout proto_layout;
+    if (seg_mode) {
+        if (outputs.size() < 2) {
+            error = "YOLOv26 segmentation output requires 2 outputs (pred + proto)";
+            return false;
+        }
+        proto = &outputs[1];
+        if (proto->empty()) {
+            error = "YOLOv26 segmentation proto output is empty";
+            return false;
+        }
+        std::vector<int64_t> proto_dims;
+        if (output_infos.size() >= 2) {
+            proto_dims = output_infos[1].dims;
+        }
+        if (!infer_yolo_seg_proto_layout(*proto, proto_dims, coeff_count, proto_layout)) {
+            error = "YOLOv26 segmentation proto shape is not supported";
+            return false;
+        }
+    }
+
+    auto at = [&](int box_idx, int attr_idx) -> float {
+        return at_with_layout(attrs_first, box_idx, attr_idx);
+    };
+
+    if (debug_parse) {
+        std::cout << "yolo26 parse debug: attrs=" << attrs
+                  << " boxes=" << num_boxes
+                  << " attrs_first=" << (attrs_first ? "true" : "false")
+                  << " seg_mode=" << (seg_mode ? "true" : "false")
+                  << std::endl;
+        std::vector<std::tuple<float, int, float, float>> int_like;
+        int_like.reserve(static_cast<size_t>(attrs));
+        for (int a = 0; a < attrs; ++a) {
+            int ok = 0;
+            float vmin = std::numeric_limits<float>::infinity();
+            float vmax = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < num_boxes; ++i) {
+                const float v = at(i, a);
+                vmin = std::min(vmin, v);
+                vmax = std::max(vmax, v);
+                const int r = static_cast<int>(std::lround(v));
+                if (std::fabs(v - static_cast<float>(r)) < 1e-3f && r >= 0 && r <= 4095) {
+                    ++ok;
+                }
+            }
+            const float ratio = num_boxes > 0 ? static_cast<float>(ok) / static_cast<float>(num_boxes) : 0.0f;
+            int_like.emplace_back(ratio, a, vmin, vmax);
+        }
+        std::sort(int_like.begin(), int_like.end(), [](const auto & lhs, const auto & rhs) {
+            return std::get<0>(lhs) > std::get<0>(rhs);
+        });
+        const int topk_stats = std::min<int>(5, static_cast<int>(int_like.size()));
+        for (int i = 0; i < topk_stats; ++i) {
+            std::cout << "  int-like attr[" << std::get<1>(int_like[static_cast<size_t>(i)])
+                      << "] ratio=" << std::get<0>(int_like[static_cast<size_t>(i)])
+                      << " range=[" << std::get<2>(int_like[static_cast<size_t>(i)])
+                      << "," << std::get<3>(int_like[static_cast<size_t>(i)]) << "]"
+                      << std::endl;
+        }
+        const int preview = std::min(num_boxes, 5);
+        for (int i = 0; i < preview; ++i) {
+            std::cout << "  box[" << i << "]:";
+            const int max_attr = std::min(attrs, 10);
+            for (int a = 0; a < max_attr; ++a) {
+                std::cout << " " << at(i, a);
+            }
+            std::cout << std::endl;
+        }
+    }
+
+    const size_t k = static_cast<size_t>(num_boxes);
+
+    constexpr int max_det = 300;
+    constexpr int max_nms = 30000;
+    constexpr int max_supported_class_id = 4095;
+    std::vector<yolo_xyxy_seg_candidate> candidates;
+    candidates.reserve(k);
     detections.clear();
-    detections.reserve(k);
     size_t kept_conf = 0;
+    size_t rejected_bad_cls = 0;
+    size_t rejected_bad_box = 0;
     float max_score = -1.0f;
     float min_score = 1e9f;
+    int max_cls = -1;
 
     for (size_t i = 0; i < k; ++i) {
-        const float x1_raw = pred[i * 6 + 0];
-        const float y1_raw = pred[i * 6 + 1];
-        const float x2_raw = pred[i * 6 + 2];
-        const float y2_raw = pred[i * 6 + 3];
-        const float score = pred[i * 6 + 4];
-        const int cls = static_cast<int>(std::lround(pred[i * 6 + 5]));
+        const int box_idx = static_cast<int>(i);
+        const float x1_raw = at(box_idx, 0);
+        const float y1_raw = at(box_idx, 1);
+        const float x2_raw = at(box_idx, 2);
+        const float y2_raw = at(box_idx, 3);
+        const float score = at(box_idx, 4);
+        const float cls_raw = at(box_idx, 5);
+        const int cls = static_cast<int>(std::lround(cls_raw));
         max_score = std::max(max_score, score);
         min_score = std::min(min_score, score);
 
@@ -473,7 +824,8 @@ static bool postprocess_yolo_v26(
             continue;
         }
         ++kept_conf;
-        if (cls < 0 || cls >= classes) {
+        if (cls < 0 || cls > max_supported_class_id || std::fabs(cls_raw - static_cast<float>(cls)) > 1e-3f) {
+            ++rejected_bad_cls;
             continue;
         }
 
@@ -491,30 +843,171 @@ static bool postprocess_yolo_v26(
             x2 = cx + 0.5f * w;
             y2 = cy + 0.5f * h;
         }
+        const float net_x1 = x1;
+        const float net_y1 = y1;
+        const float net_x2 = x2;
+        const float net_y2 = y2;
 
         scale_box_xyxy_from_net_to_img(
             x1, y1, x2, y2,
             options.net_w, options.net_h,
             options.image_w, options.image_h);
         if (x2 <= x1 || y2 <= y1) {
+            ++rejected_bad_box;
             continue;
         }
 
+        max_cls = std::max(max_cls, cls);
+        yolo_xyxy_seg_candidate cand;
+        cand.x1 = x1;
+        cand.y1 = y1;
+        cand.x2 = x2;
+        cand.y2 = y2;
+        cand.net_x1 = net_x1;
+        cand.net_y1 = net_y1;
+        cand.net_x2 = net_x2;
+        cand.net_y2 = net_y2;
+        cand.score = score;
+        cand.cls = cls;
+        if (seg_mode) {
+            cand.mask_coeff.resize(static_cast<size_t>(coeff_count));
+            for (int c = 0; c < coeff_count; ++c) {
+                cand.mask_coeff[static_cast<size_t>(c)] = at(box_idx, 6 + c);
+            }
+        }
+        candidates.push_back(cand);
+    }
+
+    if (candidates.empty()) {
+        if (debug_parse) {
+            std::cout << "yolo26 parse debug: rejected_bad_cls=" << rejected_bad_cls
+                      << " rejected_bad_box=" << rejected_bad_box << std::endl;
+        }
+        std::cout << "yolo postprocess(" << (seg_mode ? "v26-seg" : "v26-det")
+                  << "): layout=[1x" << attrs << "x" << num_boxes << "], conf_keep=" << kept_conf
+                  << ", pre_nms=0"
+                  << ", score_range=[" << min_score << "," << max_score << "]"
+                  << std::endl;
+        return true;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const yolo_xyxy_seg_candidate & a, const yolo_xyxy_seg_candidate & b) {
+        return a.score > b.score;
+    });
+    if (static_cast<int>(candidates.size()) > max_nms) {
+        candidates.resize(static_cast<size_t>(max_nms));
+    }
+
+    std::vector<char> suppressed(candidates.size(), 0);
+    std::vector<size_t> keep;
+    keep.reserve(std::min(static_cast<size_t>(max_det), candidates.size()));
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (suppressed[i]) {
+            continue;
+        }
+        keep.push_back(i);
+        if (static_cast<int>(keep.size()) >= max_det) {
+            break;
+        }
+        const yolo_xyxy_seg_candidate & a = candidates[i];
+        for (size_t j = i + 1; j < candidates.size(); ++j) {
+            if (suppressed[j]) {
+                continue;
+            }
+            const yolo_xyxy_seg_candidate & b = candidates[j];
+            if (!options.agnostic_nms && a.cls != b.cls) {
+                continue;
+            }
+            if (box_iou_xyxy(a, b) > options.iou_thres) {
+                suppressed[j] = 1;
+            }
+        }
+    }
+
+    const int classes = max_cls + 1;
+    detections.reserve(keep.size());
+
+    const bool can_decode_mask =
+        seg_mode &&
+        options.image_w > 0 &&
+        options.image_h > 0 &&
+        options.net_w > 0 &&
+        options.net_h > 0;
+    if (seg_mode && !can_decode_mask) {
+        error = "YOLOv26 segmentation requires positive image/net sizes";
+        return false;
+    }
+    const float gain = can_decode_mask ? std::min(
+        static_cast<float>(options.net_h) / static_cast<float>(options.image_h),
+        static_cast<float>(options.net_w) / static_cast<float>(options.image_w)) : 1.0f;
+    const float pad_x = can_decode_mask ? (static_cast<float>(options.net_w) - static_cast<float>(options.image_w) * gain) * 0.5f : 0.0f;
+    const float pad_y = can_decode_mask ? (static_cast<float>(options.net_h) - static_cast<float>(options.image_h) * gain) * 0.5f : 0.0f;
+    const float proto_sx = can_decode_mask ? static_cast<float>(proto_layout.w) / static_cast<float>(options.net_w) : 1.0f;
+    const float proto_sy = can_decode_mask ? static_cast<float>(proto_layout.h) / static_cast<float>(options.net_h) : 1.0f;
+
+    for (size_t idx : keep) {
+        const yolo_xyxy_seg_candidate & cand = candidates[idx];
         YoloDetection det;
-        det.bbox = xyxy_to_cxcywh(x1, y1, x2, y2, options.image_w, options.image_h);
-        det.objectness = score;
+        det.bbox = xyxy_to_cxcywh(cand.x1, cand.y1, cand.x2, cand.y2, options.image_w, options.image_h);
+        det.objectness = cand.score;
         det.prob.assign(classes, 0.0f);
-        det.prob[static_cast<size_t>(cls)] = score;
+        det.prob[static_cast<size_t>(cand.cls)] = cand.score;
+
+        if (can_decode_mask) {
+            std::vector<float> proto_mask(static_cast<size_t>(proto_layout.h) * static_cast<size_t>(proto_layout.w), 0.0f);
+            const float px1 = cand.net_x1 * proto_sx;
+            const float py1 = cand.net_y1 * proto_sy;
+            const float px2 = cand.net_x2 * proto_sx;
+            const float py2 = cand.net_y2 * proto_sy;
+            for (int py = 0; py < proto_layout.h; ++py) {
+                const float y_center = static_cast<float>(py) + 0.5f;
+                for (int px = 0; px < proto_layout.w; ++px) {
+                    const float x_center = static_cast<float>(px) + 0.5f;
+                    if (x_center < px1 || x_center > px2 || y_center < py1 || y_center > py2) {
+                        continue;
+                    }
+                    float v = 0.0f;
+                    for (int c = 0; c < proto_layout.nm; ++c) {
+                        v += cand.mask_coeff[static_cast<size_t>(c)] * yolo_proto_value(*proto, proto_layout, c, py, px);
+                    }
+                    proto_mask[static_cast<size_t>(py) * static_cast<size_t>(proto_layout.w) + static_cast<size_t>(px)] = sigmoidf(v);
+                }
+            }
+
+            det.mask_w = options.image_w;
+            det.mask_h = options.image_h;
+            det.mask.assign(static_cast<size_t>(det.mask_w) * static_cast<size_t>(det.mask_h), static_cast<uint8_t>(0));
+
+            const int ix1 = std::max(0, static_cast<int>(std::floor(cand.x1)));
+            const int iy1 = std::max(0, static_cast<int>(std::floor(cand.y1)));
+            const int ix2 = std::min(det.mask_w - 1, static_cast<int>(std::ceil(cand.x2)));
+            const int iy2 = std::min(det.mask_h - 1, static_cast<int>(std::ceil(cand.y2)));
+            if (ix2 >= ix1 && iy2 >= iy1) {
+                for (int iy = iy1; iy <= iy2; ++iy) {
+                    const float net_y = (static_cast<float>(iy) + 0.5f) * gain + pad_y;
+                    const float proto_y = net_y * proto_sy;
+                    for (int ix = ix1; ix <= ix2; ++ix) {
+                        const float net_x = (static_cast<float>(ix) + 0.5f) * gain + pad_x;
+                        const float proto_x = net_x * proto_sx;
+                        const float m = bilinear_sample_2d(proto_mask, proto_layout.w, proto_layout.h, proto_x, proto_y);
+                        if (m >= 0.5f) {
+                            det.mask[static_cast<size_t>(iy) * static_cast<size_t>(det.mask_w) + static_cast<size_t>(ix)] = static_cast<uint8_t>(1);
+                        }
+                    }
+                }
+            }
+        }
+
         detections.push_back(std::move(det));
     }
 
-    std::cout << "yolo postprocess: layout=[x1,y1,x2,y2,score,cls], conf_keep=" << kept_conf
+    std::cout << "yolo postprocess(" << (seg_mode ? "v26-seg" : "v26-det")
+              << "): layout=[1x" << attrs << "x" << num_boxes << "], conf_keep=" << kept_conf
               << ", pre_nms=" << detections.size()
               << ", score_range=[" << min_score << "," << max_score << "]"
               << std::endl;
-
-    do_nms_sort(detections, classes, options.iou_thres, options.agnostic_nms);
-    std::cout << "yolo postprocess: post_nms=" << detections.size() << std::endl;
+    std::cout << "yolo postprocess(" << (seg_mode ? "v26-seg" : "v26-det")
+              << "): post_nms=" << detections.size() << std::endl;
     return true;
 }
 
@@ -872,10 +1365,10 @@ bool postprocess_yolo_outputs(
     std::vector<YoloDetection> & detections,
     std::string & error) {
     if (options.model_version > 0 && options.model_version <= 4) {
-        return postprocess_yolo_v4(outputs, options, detections, error);
+        return postprocess_yolo_v4(outputs, output_infos, options, detections, error);
     }
     if (options.model_version == 26 || options.model_version == 10) {
-        return postprocess_yolo_v26(outputs, options, detections, error);
+        return postprocess_yolo_v26(outputs, output_infos, options, detections, error);
     }
     if (options.model_version == 5) {
         return postprocess_yolo_v5(outputs, output_infos, options, detections, error);
@@ -890,4 +1383,3 @@ bool postprocess_yolo_outputs(
 }
 
 } // namespace mini2gguf
-

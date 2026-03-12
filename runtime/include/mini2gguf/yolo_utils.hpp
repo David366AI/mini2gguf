@@ -2,6 +2,7 @@
 
 #include "mini2gguf/model_runtime.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,9 @@ struct YoloDetection {
     YoloBox bbox;
     std::vector<float> prob;
     float objectness = 0.0f;
+    std::vector<uint8_t> mask;
+    int mask_w = 0;
+    int mask_h = 0;
 };
 
 struct YoloPostprocessOptions {
@@ -39,4 +43,3 @@ bool postprocess_yolo_outputs(
     std::string & error);
 
 } // namespace mini2gguf
-

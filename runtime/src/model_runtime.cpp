@@ -1062,6 +1062,8 @@ namespace mini2gguf
         model_metadata_.clear();
         node_output_names_.clear();
         node_output_tensors_.clear();
+        debug_dump_names_.clear();
+        debug_dump_tensors_.clear();
         weight_buffer_bytes_ = 0;
         last_compute_buffer_bytes_ = 0;
         last_compute_peak_bytes_ = 0;
@@ -1222,6 +1224,8 @@ namespace mini2gguf
                 node.dilations = to_i32_vec(get_i64_array(*attrs, "dilations"));
                 node.pads = to_i32_vec(get_i64_array(*attrs, "pads"));
                 node.kernel_shape = to_i32_vec(get_i64_array(*attrs, "kernel_shape"));
+                node.output_padding = to_i32_vec(get_i64_array(*attrs, "output_padding"));
+                node.output_shape = get_i64_array(*attrs, "output_shape");
                 node.auto_pad = get_string(*attrs, "auto_pad", "");
                 node.group = static_cast<int>(get_i64(*attrs, "group", 1));
                 node.alpha = static_cast<float>(get_f64(*attrs, "alpha", 0.01));
@@ -1751,6 +1755,14 @@ namespace mini2gguf
                         x = ggml_cast(ctx, x, GGML_TYPE_F32);
                     }
                 }
+                if (env_flag_enabled("MINI2GGUF_FORCE_DIRECT_X_F32") && x->type == GGML_TYPE_F16)
+                {
+                    x = ggml_cast(ctx, x, GGML_TYPE_F32);
+                }
+                if (env_flag_enabled("MINI2GGUF_FORCE_DIRECT_W_F32") && w->type == GGML_TYPE_F16)
+                {
+                    w = ggml_cast(ctx, w, GGML_TYPE_F32);
+                }
 
                 const std::vector<int> strides = node.strides.empty() ? std::vector<int>{1, 1} : node.strides;
                 const std::vector<int> dilations = node.dilations.empty() ? std::vector<int>{1, 1} : node.dilations;
@@ -1798,11 +1810,34 @@ namespace mini2gguf
                     const ggml_backend_t backend = reinterpret_cast<ggml_backend_t>(backend_);
                     const ggml_backend_dev_t dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
                     const bool is_cpu_backend = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-                    const bool weight_type_ok = w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32;
-                    const bool input_type_ok = x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32;
+                    // Default-on: allow direct F16 conv on CPU.
+                    // Compatibility:
+                    // - MINI2GGUF_ENABLE_CPU_CONV_DIRECT_F16=0 can disable it.
+                    // - MINI2GGUF_DISABLE_CPU_CONV_DIRECT_F16=1 also disables it.
+                    bool allow_cpu_conv_direct_f16 = true;
+                    if (std::getenv("MINI2GGUF_ENABLE_CPU_CONV_DIRECT_F16") != nullptr)
+                    {
+                        allow_cpu_conv_direct_f16 = env_flag_enabled("MINI2GGUF_ENABLE_CPU_CONV_DIRECT_F16");
+                    }
+                    if (env_flag_enabled("MINI2GGUF_DISABLE_CPU_CONV_DIRECT_F16"))
+                    {
+                        allow_cpu_conv_direct_f16 = false;
+                    }
+                    const bool weight_type_ok =
+                        w->type == GGML_TYPE_F32 ||
+                        (allow_cpu_conv_direct_f16 && w->type == GGML_TYPE_F16);
+                    const bool input_type_ok =
+                        x->type == GGML_TYPE_F32 ||
+                        (allow_cpu_conv_direct_f16 && x->type == GGML_TYPE_F16);
                     const bool can_use_direct = !disable_cpu_conv_direct && is_cpu_backend && weight_type_ok && input_type_ok;
                     const bool debug_conv_direct = env_flag_enabled("MINI2GGUF_DEBUG_CONV_DIRECT");
-                    if (debug_conv_direct && node.name.find("dfl/conv/Conv") != std::string::npos)
+                    const char *debug_conv_filter = std::getenv("MINI2GGUF_DEBUG_CONV_DIRECT_FILTER");
+                    const std::string debug_filter =
+                        (debug_conv_filter != nullptr && debug_conv_filter[0] != '\0')
+                            ? std::string(debug_conv_filter)
+                            : std::string("dfl/conv/Conv");
+                    const bool debug_conv_this_node = debug_conv_direct && node.name.find(debug_filter) != std::string::npos;
+                    if (debug_conv_this_node)
                     {
                         std::cout << "conv-direct debug: node=" << node.name
                                   << " can_use_direct=" << (can_use_direct ? 1 : 0)
@@ -1828,7 +1863,7 @@ namespace mini2gguf
                         {
                             x_direct = ggml_cont(ctx, x_direct);
                         }
-                        if (debug_conv_direct && node.name.find("dfl/conv/Conv") != std::string::npos)
+                        if (debug_conv_this_node)
                         {
                             std::cout << "conv-direct debug: node=" << node.name
                                       << " x_direct.contig=" << (ggml_is_contiguous(x_direct) ? 1 : 0)
@@ -1970,9 +2005,128 @@ namespace mini2gguf
                 continue;
             }
 
+            if (node.op_type == "ConvTranspose")
+            {
+                if (node.inputs.size() < 2)
+                {
+                    return fail_with_cleanup("ConvTranspose requires at least 2 inputs: " + node.name);
+                }
+
+                ggml_tensor *x = values.at(node.inputs[0]);
+                ggml_tensor *w = values.at(node.inputs[1]);
+
+                if (node.group != 1)
+                {
+                    return fail_with_cleanup("ConvTranspose group != 1 is not supported: " + node.name);
+                }
+
+                const std::vector<int> strides = node.strides.empty() ? std::vector<int>{1, 1} : node.strides;
+                const std::vector<int> dilations = node.dilations.empty() ? std::vector<int>{1, 1} : node.dilations;
+                const std::vector<int> pads = node.pads.empty() ? std::vector<int>{0, 0, 0, 0} : node.pads;
+
+                const int stride_h = strides[0];
+                const int stride_w = strides.size() > 1 ? strides[1] : strides[0];
+                if (stride_h != stride_w)
+                {
+                    return fail_with_cleanup("ConvTranspose requires equal H/W stride: " + node.name);
+                }
+                if (stride_h <= 0)
+                {
+                    return fail_with_cleanup("ConvTranspose stride must be > 0: " + node.name);
+                }
+
+                for (int d : dilations)
+                {
+                    if (d != 1)
+                    {
+                        return fail_with_cleanup("ConvTranspose dilation != 1 is not supported: " + node.name);
+                    }
+                }
+                for (int p : pads)
+                {
+                    if (p != 0)
+                    {
+                        return fail_with_cleanup("ConvTranspose non-zero pads are not supported: " + node.name);
+                    }
+                }
+                for (int p : node.output_padding)
+                {
+                    if (p != 0)
+                    {
+                        return fail_with_cleanup("ConvTranspose output_padding != 0 is not supported: " + node.name);
+                    }
+                }
+                if (!node.output_shape.empty())
+                {
+                    return fail_with_cleanup("ConvTranspose output_shape attribute is not supported: " + node.name);
+                }
+                if (!node.auto_pad.empty() && node.auto_pad != "NOTSET" && node.auto_pad != "VALID")
+                {
+                    return fail_with_cleanup("ConvTranspose auto_pad is not supported: " + node.name);
+                }
+
+                if (!ggml_is_contiguous(x))
+                {
+                    x = ggml_cont(ctx, x);
+                }
+                if (!ggml_is_contiguous(w))
+                {
+                    w = ggml_cont(ctx, w);
+                }
+
+                // ggml ConvTranspose kernels expect:
+                // - input:  F32
+                // - weight: F16 with layout [KW, KH, Cout, Cin]
+                if (x->type != GGML_TYPE_F32)
+                {
+                    x = ggml_cast(ctx, x, GGML_TYPE_F32);
+                }
+                if (w->type != GGML_TYPE_F16)
+                {
+                    w = ggml_cast(ctx, w, GGML_TYPE_F16);
+                }
+
+                if (w->ne[3] != x->ne[2])
+                {
+                    std::ostringstream oss;
+                    oss << "ConvTranspose channel mismatch in " << node.name
+                        << " weight.ne3(Cin)=" << w->ne[3]
+                        << " input.ne2(Cin)=" << x->ne[2];
+                    return fail_with_cleanup(oss.str());
+                }
+
+                ggml_tensor *y = ggml_conv_transpose_2d_p0(ctx, w, x, stride_h);
+                if (node.inputs.size() >= 3)
+                {
+                    ggml_tensor *b = values.at(node.inputs[2]);
+                    ggml_tensor *b_for_add = b;
+                    if (ggml_n_dims(b_for_add) == 1)
+                    {
+                        b_for_add = ggml_reshape_4d(ctx, b_for_add, 1, 1, b_for_add->ne[0], 1);
+                    }
+                    if (!ggml_can_repeat(b_for_add, y))
+                    {
+                        return fail_with_cleanup("ConvTranspose bias cannot be broadcast to output tensor: " + node.name);
+                    }
+                    if (b_for_add->type != y->type)
+                    {
+                        b_for_add = ggml_cast(ctx, b_for_add, y->type);
+                    }
+                    y = ggml_add(ctx, y, b_for_add);
+                }
+
+                values[node.outputs[0]] = y;
+                continue;
+            }
+
             if (node.op_type == "Sigmoid")
             {
                 ggml_tensor *x = values.at(node.inputs[0]);
+                const bool force_sigmoid_f32 = env_flag_enabled("MINI2GGUF_FORCE_SIGMOID_F32");
+                if (force_sigmoid_f32 && x->type == GGML_TYPE_F16)
+                {
+                    x = ggml_cast(ctx, x, GGML_TYPE_F32);
+                }
                 if (!ggml_is_contiguous(x))
                 {
                     x = ggml_cont(ctx, x);
@@ -2332,6 +2486,10 @@ namespace mini2gguf
                 }
 
                 ggml_tensor *y = ggml_mul_mat(ctx, lhs, rhs);
+                if (env_flag_enabled("MINI2GGUF_FORCE_MATMUL_CONT") && !ggml_is_contiguous(y))
+                {
+                    y = ggml_cont(ctx, y);
+                }
                 values[node.outputs[0]] = y;
                 continue;
             }
@@ -2642,6 +2800,7 @@ namespace mini2gguf
 
             if (node.op_type == "Add" || node.op_type == "Mul")
             {
+                const bool force_add_mul_f32 = env_flag_enabled("MINI2GGUF_FORCE_ADD_MUL_F32");
                 if (node.op_type == "Mul" && node.inputs.size() >= 2)
                 {
                     if (ggml_tensor *fused = try_fuse_silu(node.inputs[0], node.inputs[1]))
@@ -2706,7 +2865,7 @@ namespace mini2gguf
                     }
                 }
 
-                if (a->type != b->type)
+                if (force_add_mul_f32 || a->type != b->type)
                 {
                     a = ggml_cast(ctx, a, GGML_TYPE_F32);
                     b = ggml_cast(ctx, b, GGML_TYPE_F32);
@@ -2888,6 +3047,11 @@ namespace mini2gguf
             if (node.op_type == "Transpose")
             {
                 ggml_tensor *x = values.at(node.inputs[0]);
+                const bool force_transpose_f32 = env_flag_enabled("MINI2GGUF_FORCE_TRANSPOSE_F32");
+                if (force_transpose_f32 && x->type == GGML_TYPE_F16)
+                {
+                    x = ggml_cast(ctx, x, GGML_TYPE_F32);
+                }
                 int input_rank = 4;
                 if (auto it = tensor_rank_by_name_.find(node.inputs[0]); it != tensor_rank_by_name_.end() && it->second >= 1 && it->second <= 4)
                 {
@@ -3030,12 +3194,17 @@ namespace mini2gguf
                 }
 
                 int64_t offset = 0;
+                const bool force_split_cont = env_flag_enabled("MINI2GGUF_FORCE_SPLIT_CONT");
                 for (size_t i = 0; i < node.outputs.size(); ++i)
                 {
                     std::array<int64_t, 4> ne = {x->ne[0], x->ne[1], x->ne[2], x->ne[3]};
                     ne[axis_ggml] = splits[i];
                     const size_t byte_offset = static_cast<size_t>(offset) * x->nb[axis_ggml];
                     ggml_tensor *view = ggml_view_4d(ctx, x, ne[0], ne[1], ne[2], ne[3], x->nb[1], x->nb[2], x->nb[3], byte_offset);
+                    if (force_split_cont)
+                    {
+                        view = ggml_cont(ctx, view);
+                    }
                     values[node.outputs[i]] = view;
                     offset += splits[i];
                 }
@@ -3044,6 +3213,8 @@ namespace mini2gguf
 
             if (node.op_type == "Concat")
             {
+                const bool force_concat_f32 = env_flag_enabled("MINI2GGUF_FORCE_CONCAT_F32");
+                const bool force_concat_cont = env_flag_enabled("MINI2GGUF_FORCE_CONCAT_CONT");
                 int input_rank = 4;
                 if (auto it = tensor_rank_by_name_.find(node.inputs[0]); it != tensor_rank_by_name_.end() && it->second >= 1 && it->second <= 4)
                 {
@@ -3051,9 +3222,25 @@ namespace mini2gguf
                 }
                 const int axis_ggml = map_onnx_axis_to_ggml(node.axis, input_rank);
                 ggml_tensor *y = values.at(node.inputs[0]);
+                if (force_concat_f32 && y->type != GGML_TYPE_F32)
+                {
+                    y = ggml_cast(ctx, y, GGML_TYPE_F32);
+                }
+                if (force_concat_cont && !ggml_is_contiguous(y))
+                {
+                    y = ggml_cont(ctx, y);
+                }
                 for (size_t i = 1; i < node.inputs.size(); ++i)
                 {
                     ggml_tensor *rhs = values.at(node.inputs[i]);
+                    if (force_concat_f32 && rhs->type != GGML_TYPE_F32)
+                    {
+                        rhs = ggml_cast(ctx, rhs, GGML_TYPE_F32);
+                    }
+                    if (force_concat_cont && !ggml_is_contiguous(rhs))
+                    {
+                        rhs = ggml_cont(ctx, rhs);
+                    }
                     if (rhs->type != y->type)
                     {
                         rhs = ggml_cast(ctx, rhs, y->type);
@@ -3076,6 +3263,10 @@ namespace mini2gguf
                         }
                     }
                     y = ggml_concat(ctx, y, rhs, axis_ggml);
+                    if (force_concat_cont && !ggml_is_contiguous(y))
+                    {
+                        y = ggml_cont(ctx, y);
+                    }
                 }
                 values[node.outputs[0]] = y;
                 continue;
@@ -3083,6 +3274,7 @@ namespace mini2gguf
 
             if (node.op_type == "Gather")
             {
+                const bool force_gather_f32 = env_flag_enabled("MINI2GGUF_FORCE_GATHER_F32");
                 // Gather fallback for yolo26n pattern:
                 // data [N, C], indices [B, K], axis=0 -> output [B, K, C]
                 if (node.inputs.size() < 2 || node.outputs.empty())
@@ -3132,7 +3324,7 @@ namespace mini2gguf
                 {
                     data_for_gather = ggml_cont(ctx, data_for_gather);
                 }
-                if (data_for_gather->type == GGML_TYPE_I32)
+                if (data_for_gather->type == GGML_TYPE_I32 || (force_gather_f32 && data_for_gather->type == GGML_TYPE_F16))
                 {
                     // ggml_gather_elements currently supports F16/F32 data only.
                     data_for_gather = ggml_cast(ctx, data_for_gather, GGML_TYPE_F32);
@@ -3164,7 +3356,7 @@ namespace mini2gguf
                 ggml_tensor *y = ggml_gather_elements(ctx, data3, idx3, map_onnx_axis_to_ggml(1, 3));
 
                 // Keep output dtype consistent with original data tensor.
-                if (y->type != data_orig_type)
+                if (!force_gather_f32 && y->type != data_orig_type)
                 {
                     y = ggml_cast(ctx, y, data_orig_type);
                 }
@@ -3174,6 +3366,7 @@ namespace mini2gguf
 
             if (node.op_type == "GatherElements")
             {
+                const bool force_gather_elements_f32 = env_flag_enabled("MINI2GGUF_FORCE_GATHER_ELEMENTS_F32");
                 if (node.inputs.size() < 2 || node.outputs.empty())
                 {
                     return fail_with_cleanup("GatherElements expects 2 inputs and 1 output: " + node.name);
@@ -3181,6 +3374,12 @@ namespace mini2gguf
 
                 ggml_tensor *data = values.at(node.inputs[0]);
                 ggml_tensor *indices = values.at(node.inputs[1]);
+
+                const ggml_type data_orig_type = data->type;
+                if (force_gather_elements_f32 && data->type == GGML_TYPE_F16)
+                {
+                    data = ggml_cast(ctx, data, GGML_TYPE_F32);
+                }
 
                 if (data->type != GGML_TYPE_F32 && data->type != GGML_TYPE_F16)
                 {
@@ -3231,6 +3430,10 @@ namespace mini2gguf
                 }
 
                 ggml_tensor *y = ggml_gather_elements(ctx, data, indices, axis_ggml);
+                if (!force_gather_elements_f32 && y->type != data_orig_type)
+                {
+                    y = ggml_cast(ctx, y, data_orig_type);
+                }
                 values[node.outputs[0]] = y;
                 continue;
             }
@@ -3311,10 +3514,43 @@ namespace mini2gguf
             }
         }
 
+        int pin_output_prefix = -1;
+        if (const char *pin_env = std::getenv("MINI2GGUF_PIN_NODE_OUTPUT_PREFIX"))
+        {
+            pin_output_prefix = std::atoi(pin_env);
+        }
+        if (pin_output_prefix >= 0)
+        {
+            int out_idx = 0;
+            for (const NodeDef *node_ptr : execution_nodes)
+            {
+                const NodeDef &node = *node_ptr;
+                for (const std::string &out_name : node.outputs)
+                {
+                    auto vit = values.find(out_name);
+                    if (vit == values.end() || vit->second == nullptr)
+                    {
+                        continue;
+                    }
+                    if (out_idx <= pin_output_prefix)
+                    {
+                        ggml_set_output(vit->second);
+                    }
+                    ++out_idx;
+                }
+            }
+        }
+
         std::vector<ggml_tensor *> outputs;
         outputs.reserve(graph_outputs_.size());
-        for (const auto &output_info : graph_outputs_)
+        const bool only_first_output = env_flag_enabled("MINI2GGUF_DEBUG_ONLY_FIRST_OUTPUT");
+        for (size_t output_i = 0; output_i < graph_outputs_.size(); ++output_i)
         {
+            if (only_first_output && output_i > 0)
+            {
+                break;
+            }
+            const auto &output_info = graph_outputs_[output_i];
             auto oit = values.find(output_info.name);
             if (oit == values.end())
             {
@@ -3327,13 +3563,68 @@ namespace mini2gguf
             {
                 out = ggml_cont(ctx, out);
             }
+            ggml_set_output(out);
             outputs.push_back(out);
+        }
+
+        const char *dump_path = std::getenv("MINI2GGUF_DUMP_NODE_VALUES_PATH");
+        const bool dump_node_values = dump_path != nullptr && dump_path[0] != '\0';
+        int dump_node_index = -1;
+        if (const char *dump_idx_env = std::getenv("MINI2GGUF_DUMP_NODE_INDEX"))
+        {
+            dump_node_index = std::atoi(dump_idx_env);
+        }
+        std::vector<std::string> debug_dump_names;
+        std::vector<ggml_tensor *> debug_dump_tensors;
+        if (dump_node_values)
+        {
+            debug_dump_names.reserve(nodes_.size());
+            debug_dump_tensors.reserve(nodes_.size());
+            int out_idx = 0;
+            for (const NodeDef *node_ptr : execution_nodes)
+            {
+                const NodeDef &node = *node_ptr;
+                for (const std::string &out_name : node.outputs)
+                {
+                    auto vit = values.find(out_name);
+                    if (vit == values.end() || vit->second == nullptr)
+                    {
+                        ++out_idx;
+                        continue;
+                    }
+                    if (dump_node_index >= 0 && out_idx != dump_node_index)
+                    {
+                        ++out_idx;
+                        continue;
+                    }
+                    ggml_tensor *t = vit->second;
+                    if (t->view_src != nullptr || !ggml_is_contiguous(t))
+                    {
+                        t = ggml_cont(ctx, t);
+                    }
+                    if (t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64)
+                    {
+                        t = ggml_cast(ctx, t, GGML_TYPE_F32);
+                    }
+                    ggml_set_output(t);
+                    debug_dump_names.push_back(out_name);
+                    debug_dump_tensors.push_back(t);
+                    ++out_idx;
+                }
+            }
         }
 
         ggml_cgraph *gf = ggml_new_graph_custom(ctx, graph_size_hint, false);
         for (ggml_tensor *out : outputs)
         {
             ggml_build_forward_expand(gf, out);
+        }
+        if (dump_node_values)
+        {
+            for (ggml_tensor *t : debug_dump_tensors)
+            {
+                ggml_build_forward_expand(gf, t);
+            }
         }
 
         ggml_gallocr_t gallocr = ggml_gallocr_new(
@@ -3360,8 +3651,12 @@ namespace mini2gguf
 
         node_output_names_.clear();
         node_output_tensors_.clear();
+        debug_dump_names_.clear();
+        debug_dump_tensors_.clear();
         node_output_names_.reserve(nodes_.size());
         node_output_tensors_.reserve(nodes_.size());
+        debug_dump_names_.reserve(debug_dump_names.size());
+        debug_dump_tensors_.reserve(debug_dump_tensors.size());
         for (const NodeDef *node_ptr : execution_nodes)
         {
             const NodeDef &node = *node_ptr;
@@ -3375,6 +3670,11 @@ namespace mini2gguf
                 node_output_names_.push_back(out_name);
                 node_output_tensors_.push_back(vit->second);
             }
+        }
+        if (dump_node_values)
+        {
+            debug_dump_names_ = std::move(debug_dump_names);
+            debug_dump_tensors_ = std::move(debug_dump_tensors);
         }
 
         return true;
@@ -3581,6 +3881,202 @@ namespace mini2gguf
         if (status != GGML_STATUS_SUCCESS)
         {
             return set_error("ggml backend graph compute failed");
+        }
+
+        const char *dump_path = std::getenv("MINI2GGUF_DUMP_NODE_VALUES_PATH");
+        if (dump_path != nullptr && dump_path[0] != '\0' &&
+            !debug_dump_names_.empty() &&
+            debug_dump_names_.size() == debug_dump_tensors_.size())
+        {
+            const int dump_max_values = env_int_or_default("MINI2GGUF_DUMP_NODE_VALUES_MAX", 10, 1);
+            std::ofstream dump_out(dump_path, std::ios::out | std::ios::trunc);
+            if (dump_out.is_open())
+            {
+                std::unordered_map<std::string, std::string> op_by_output;
+                op_by_output.reserve(nodes_.size() * 2);
+                for (const auto &n : nodes_)
+                {
+                    for (const auto &o : n.outputs)
+                    {
+                        op_by_output[o] = n.op_type;
+                    }
+                }
+
+                for (size_t i = 0; i < debug_dump_names_.size(); ++i)
+                {
+                    const std::string &name = debug_dump_names_[i];
+                    ggml_tensor *t = debug_dump_tensors_[i];
+                    if (t == nullptr)
+                    {
+                        continue;
+                    }
+                    const size_t n = static_cast<size_t>(ggml_nelements(t));
+                    const size_t take = std::min<size_t>(n, static_cast<size_t>(dump_max_values));
+                    const auto op_it = op_by_output.find(name);
+                    const std::string op = op_it == op_by_output.end() ? "?" : op_it->second;
+
+                    dump_out << "idx=" << i
+                             << "\tname=" << name
+                             << "\top=" << op
+                             << "\ttype=" << ggml_type_name(t->type)
+                             << "\tne=[" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "]"
+                             << "\tvals=";
+
+                    auto dump_sep = [&](size_t k)
+                    {
+                        if (k > 0)
+                        {
+                            dump_out << ",";
+                        }
+                    };
+
+                    if (take > 0)
+                    {
+                        if (t->buffer == nullptr)
+                        {
+                            dump_out << "<no-buffer>";
+                            dump_out << "\n";
+                            continue;
+                        }
+
+                        if (t->type == GGML_TYPE_F32)
+                        {
+                            std::vector<float> buf(take);
+                            ggml_backend_tensor_get(t, buf.data(), 0, take * sizeof(float));
+                            for (size_t k = 0; k < take; ++k)
+                            {
+                                dump_sep(k);
+                                dump_out << buf[k];
+                            }
+                        }
+                        else if (t->type == GGML_TYPE_F16)
+                        {
+                            std::vector<ggml_fp16_t> buf(take);
+                            ggml_backend_tensor_get(t, buf.data(), 0, take * sizeof(ggml_fp16_t));
+                            for (size_t k = 0; k < take; ++k)
+                            {
+                                dump_sep(k);
+                                dump_out << ggml_fp16_to_fp32(buf[k]);
+                            }
+                        }
+                        else if (t->type == GGML_TYPE_I32)
+                        {
+                            std::vector<int32_t> buf(take);
+                            ggml_backend_tensor_get(t, buf.data(), 0, take * sizeof(int32_t));
+                            for (size_t k = 0; k < take; ++k)
+                            {
+                                dump_sep(k);
+                                dump_out << buf[k];
+                            }
+                        }
+                        else if (t->type == GGML_TYPE_I64)
+                        {
+                            std::vector<int64_t> buf(take);
+                            ggml_backend_tensor_get(t, buf.data(), 0, take * sizeof(int64_t));
+                            for (size_t k = 0; k < take; ++k)
+                            {
+                                dump_sep(k);
+                                dump_out << buf[k];
+                            }
+                        }
+                        else
+                        {
+                            dump_out << "<unsupported>";
+                        }
+                    }
+                    dump_out << "\n";
+                }
+            }
+        }
+
+        if (env_flag_enabled("MINI2GGUF_DEBUG_FIRST_NONFINITE"))
+        {
+            bool found_nonfinite = false;
+            for (size_t i = 0; i < node_output_tensors_.size() && i < node_output_names_.size(); ++i)
+            {
+                ggml_tensor *t = node_output_tensors_[i];
+                if (t == nullptr)
+                {
+                    continue;
+                }
+                if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16)
+                {
+                    continue;
+                }
+
+                const size_t n = static_cast<size_t>(ggml_nelements(t));
+                if (n == 0)
+                {
+                    continue;
+                }
+
+                size_t first_bad_index = n;
+                float first_bad_value = 0.0f;
+
+                if (t->type == GGML_TYPE_F32)
+                {
+                    std::vector<float> buf(n);
+                    if (t->buffer != nullptr)
+                    {
+                        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                    }
+                    else
+                    {
+                        std::memcpy(buf.data(), t->data, n * sizeof(float));
+                    }
+
+                    for (size_t k = 0; k < n; ++k)
+                    {
+                        const float v = buf[k];
+                        if (!std::isfinite(v))
+                        {
+                            first_bad_index = k;
+                            first_bad_value = v;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    std::vector<ggml_fp16_t> buf(n);
+                    if (t->buffer != nullptr)
+                    {
+                        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(ggml_fp16_t));
+                    }
+                    else
+                    {
+                        std::memcpy(buf.data(), t->data, n * sizeof(ggml_fp16_t));
+                    }
+
+                    for (size_t k = 0; k < n; ++k)
+                    {
+                        const float v = ggml_fp16_to_fp32(buf[k]);
+                        if (!std::isfinite(v))
+                        {
+                            first_bad_index = k;
+                            first_bad_value = v;
+                            break;
+                        }
+                    }
+                }
+
+                if (first_bad_index != n)
+                {
+                    std::cout << "first-nonfinite node=" << node_output_names_[i]
+                              << " type=" << (t->type == GGML_TYPE_F16 ? "f16" : "f32")
+                              << " ne=[" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "]"
+                              << " flat_index=" << first_bad_index
+                              << " value=" << first_bad_value
+                              << std::endl;
+                    found_nonfinite = true;
+                    break;
+                }
+            }
+
+            if (!found_nonfinite)
+            {
+                std::cout << "first-nonfinite: none" << std::endl;
+            }
         }
 
         const char *debug_node_stats = std::getenv("MINI2GGUF_DEBUG_NODE_STATS");

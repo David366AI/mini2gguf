@@ -65,3 +65,4 @@ perf.data.*
 predictions_dynamic.jpg
 
 ggml-local.bundle
+assets/images/runs/**

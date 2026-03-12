@@ -70,6 +70,12 @@ def _build_parser() -> argparse.ArgumentParser:
 		action="store_true",
 		help="Also export standalone <stem>.json and do not embed graph JSON into GGUF metadata.",
 	)
+	parser.add_argument(
+		"-keep-onnx",
+		"--keep-onnx",
+		action="store_true",
+		help="When input is PT, keep intermediate ONNX files instead of removing them after successful conversion.",
+	)
 	return parser
 
 
@@ -162,8 +168,8 @@ def main() -> int:
 		conversion_succeeded = True
 	finally:
 		# PT -> ONNX is an intermediate step. Remove generated ONNX artifacts
-		# after successful conversion so only final outputs remain.
-		if should_delete_onnx and conversion_succeeded:
+		# after successful conversion unless user explicitly keeps them.
+		if should_delete_onnx and conversion_succeeded and not args.keep_onnx:
 			to_remove = [onnx_path, onnx_path.with_suffix(onnx_path.suffix + ".data"), Path(str(onnx_path) + ".data")]
 			removed: set[Path] = set()
 			for path in to_remove:
@@ -173,6 +179,8 @@ def main() -> int:
 					path.unlink()
 					removed.add(path)
 					print(f"Temporary file removed: {path}")
+		elif should_delete_onnx and conversion_succeeded and args.keep_onnx:
+			print(f"Temporary ONNX kept (--keep-onnx): {onnx_path}")
 	return 0
 
 

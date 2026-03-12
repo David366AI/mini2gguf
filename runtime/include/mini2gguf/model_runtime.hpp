@@ -61,6 +61,8 @@ public:
         std::vector<int> dilations;
         std::vector<int> pads;
         std::vector<int> kernel_shape;
+        std::vector<int> output_padding;
+        std::vector<int64_t> output_shape;
         std::string auto_pad;
         int group = 1;
 
@@ -123,6 +125,8 @@ private:
     std::vector<ggml_tensor *> output_tensors_;
     std::vector<std::string> node_output_names_;
     std::vector<ggml_tensor *> node_output_tensors_;
+    std::vector<std::string> debug_dump_names_;
+    std::vector<ggml_tensor *> debug_dump_tensors_;
 
     size_t weight_buffer_bytes_ = 0;
     size_t last_compute_buffer_bytes_ = 0;
