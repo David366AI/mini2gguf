@@ -211,12 +211,21 @@ Examples:
 
 Converter pt to gguf
 ```bash
+wget -O assets/models/yolo/yolo26n-seg.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-seg.pt
 python converter/yolo2gguf.py -i ./assets/models/yolo/yolo26n-seg.pt -v 26 -c segmentation
+
+wget -O assets/models/yolo/yolo11n-seg.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11n-seg.pt
+python converter/yolo2gguf.py -i ./assets/models/yolo/yolo11n-seg.pt -v 11 -c segmentation
+
+wget -O assets/models/yolo/yolov5n-seg.pt  https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n-seg.pt
+
 ```
 
 Inference
 ```bash
 ./build/examples/yolo_demo -m assets/models/yolo/yolo26n-seg.gguf -i assets/images/dog.jpg -o assets/images/segment.jpg --conf 0.50 --iou 0.45
+
+./build/examples/yolo_demo -m assets/models/yolo/yolo11n-seg.gguf -i assets/images/dog.jpg -o assets/images/segment.jpg --conf 0.50 --iou 0.45
 ```
 
 Result preview:
