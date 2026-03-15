@@ -267,10 +267,13 @@ python ./converter/crnn2gguf.py -i ./assets/models/crnn/ocr_number.onnx -d ./ass
 
 ### 8.3 Input Samples
 
-![CRNN input sample 1](assets/images/crnn-test.jpg)
-![CRNN input sample 2](assets/images/crnn-test2.jpg)
-![CRNN input sample 3](assets/images/crnn-test3.jpg)
-![CRNN input sample 4](assets/images/crnn-test4.jpg)
+crnn-test.jpg： ![CRNN input sample 1](assets/images/crnn-test.jpg)
+
+crnn-test2.jpg： ![CRNN input sample 2](assets/images/crnn-test2.jpg)
+
+crnn-test3.jpg： ![CRNN input sample 3](assets/images/crnn-test3.jpg)
+
+crnn-test4.jpg： ![CRNN input sample 4](assets/images/crnn-test4.jpg)
 
 ## 9. Additional Notes
 
