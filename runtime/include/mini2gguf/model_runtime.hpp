@@ -70,11 +70,14 @@ public:
         float epsilon = 1e-5f;
         float momentum = 0.9f;
         int to = 0;
+        int hidden_size = 0;
+        int linear_before_reset = 0;
         int largest = 1;
         int sorted = 1;
         int fmod = 0;
         int ceil_mode = 0;
         int count_include_pad = 0;
+        std::string direction = "forward";
 
         std::string const_value_name;
     };

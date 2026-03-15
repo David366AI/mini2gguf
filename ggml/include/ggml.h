@@ -488,10 +488,12 @@ extern "C" {
         GGML_OP_SUM_ROWS,
         GGML_OP_CUMSUM,
         GGML_OP_MEAN,
+        GGML_OP_REDUCE_MEAN,
         GGML_OP_REDUCE_MAX,
         GGML_OP_ARGMAX,
         GGML_OP_COUNT_EQUAL,
         GGML_OP_REPEAT,
+        GGML_OP_EXPAND,
         GGML_OP_REPEAT_BACK,
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
@@ -500,6 +502,7 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_GRU,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -1050,6 +1053,70 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // reduce mean over a single ggml axis (0..3), output shape is input shape with ne[axis] = 1
+    GGML_API struct ggml_tensor * ggml_reduce_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+                           int32_t axis);
+
+    // ONNX-style ReduceMean helper (single axis): axis uses ONNX indexing over rank [1..4].
+    // keepdims controls whether the reduced axis is retained.
+    GGML_API struct ggml_tensor * ggml_reduce_mean_onnx(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+                           int32_t axis_onnx,
+                           int32_t rank,
+                              bool keepdims);
+
+    enum ggml_gru_direction {
+        GGML_GRU_FORWARD = 0,
+        GGML_GRU_REVERSE = 1,
+        GGML_GRU_BIDIRECTIONAL = 2,
+    };
+
+    // GRU op (ONNX layout after runtime preprocessing):
+    // x : [input_size, batch, seq_len]
+    // w : [input_size, 3*hidden, num_dir]
+    // r : [hidden, 3*hidden, num_dir]
+    // b : [6*hidden, num_dir] (optional)
+    // initial_h : [hidden, batch, num_dir] (optional)
+    // Returns y : [hidden, batch, num_dir, seq_len].
+    GGML_API struct ggml_tensor * ggml_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * initial_h,
+                           int32_t hidden_size,
+                           int32_t linear_before_reset,
+                           int32_t direction);
+
+    // Returns y_h : [hidden, batch, num_dir].
+    GGML_API struct ggml_tensor * ggml_gru_last(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * initial_h,
+                           int32_t hidden_size,
+                           int32_t linear_before_reset,
+                           int32_t direction);
+
+    // ONNX-friendly wrapper that builds GRU nodes for y and optional y_h.
+    GGML_API struct ggml_tensor * ggml_gru_onnx(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * initial_h,
+                           int32_t hidden_size,
+                           int32_t linear_before_reset,
+                           int32_t direction,
+            struct ggml_tensor ** y_h_out);
+
     // max along a single ggml axis (0..3), output shape is input shape with ne[axis] = 1
     GGML_API struct ggml_tensor * ggml_reduce_max(
             struct ggml_context * ctx,
@@ -1076,6 +1143,21 @@ extern "C" {
 
     // repeat a to the specified shape
     GGML_API struct ggml_tensor * ggml_repeat_4d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+                       int64_t    ne0,
+                       int64_t    ne1,
+                       int64_t    ne2,
+                       int64_t    ne3);
+
+    // expand a to b shape with broadcast rules (each dim must be equal or 1)
+    GGML_API struct ggml_tensor * ggml_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // expand a to the specified shape with broadcast rules
+    GGML_API struct ggml_tensor * ggml_expand_4d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
                        int64_t    ne0,

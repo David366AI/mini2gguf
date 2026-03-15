@@ -726,7 +726,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_clamp_f32;
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_roll_f32;
-    vk_pipeline pipeline_repeat_f32, pipeline_repeat_back_f32;
+    vk_pipeline pipeline_repeat_f32, pipeline_repeat_f16, pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
     vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
@@ -800,7 +800,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_sum_rows_f32;
+    vk_pipeline pipeline_reduce_mean_rows[2];
     vk_pipeline pipeline_reduce_max_rows[2];
+    vk_pipeline pipeline_gru[2][2];
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1587,6 +1589,46 @@ static vk_op_reduce_max_push_constants vk_op_reduce_max_push_constants_init(cons
 
     return p;
 }
+
+struct vk_op_gru_push_constants {
+    uint32_t seq_len;
+    uint32_t batch;
+    uint32_t input_size;
+    uint32_t num_dir;
+    uint32_t hidden;
+
+    uint32_t linear_before_reset;
+    uint32_t direction;
+    uint32_t output_last;
+    uint32_t has_bias;
+    uint32_t has_h0;
+
+    uint32_t x_nb0;
+    uint32_t x_nb1;
+    uint32_t x_nb2;
+
+    uint32_t w_nb0;
+    uint32_t w_nb1;
+    uint32_t w_nb2;
+
+    uint32_t r_nb0;
+    uint32_t r_nb1;
+    uint32_t r_nb2;
+
+    uint32_t b_nb0;
+    uint32_t b_nb1;
+
+    uint32_t h0_nb0;
+    uint32_t h0_nb1;
+    uint32_t h0_nb2;
+
+    uint32_t d_nb0;
+    uint32_t d_nb1;
+    uint32_t d_nb2;
+    uint32_t d_nb3;
+
+    uint32_t scratch_stride;
+};
 
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
@@ -4419,6 +4461,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_repeat_f32, "repeat_f32", repeat_f32_len, repeat_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_repeat_f16, "repeat_f16", repeat_f16_len, repeat_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_repeat_i32, "repeat_i32", repeat_i32_len, repeat_i32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
 #define CREATE_UNARY(name)  \
@@ -4556,8 +4600,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_reduce_mean_rows[0], "reduce_mean_rows_f32", reduce_mean_rows_f32_len, reduce_mean_rows_f32_data, "main", 2, sizeof(vk_op_reduce_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_reduce_mean_rows[1], "reduce_mean_rows_f16", reduce_mean_rows_f16_len, reduce_mean_rows_f16_data, "main", 2, sizeof(vk_op_reduce_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_reduce_max_rows[0], "reduce_max_rows_f32", reduce_max_rows_f32_len, reduce_max_rows_f32_data, "main", 2, sizeof(vk_op_reduce_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_reduce_max_rows[1], "reduce_max_rows_f16", reduce_max_rows_f16_len, reduce_max_rows_f16_data, "main", 2, sizeof(vk_op_reduce_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru[0][0], "gru_xf32_wf32", gru_xf32_wf32_len, gru_xf32_wf32_data, "main", 7, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru[0][1], "gru_xf32_wf16", gru_xf32_wf16_len, gru_xf32_wf16_data, "main", 7, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru[1][0], "gru_xf16_wf32", gru_xf16_wf32_len, gru_xf16_wf32_data, "main", 7, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru[1][1], "gru_xf16_wf16", gru_xf16_wf16_len, gru_xf16_wf16_data, "main", 7, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
 
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
@@ -9217,8 +9267,18 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_REPEAT:
-        if (ggml_type_size(src0->type) == sizeof(float) && ggml_type_size(dst->type) == sizeof(float)) {
+    case GGML_OP_EXPAND:
+        if (src0->type != dst->type) {
+            return nullptr;
+        }
+        if (src0->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_repeat_f32;
+        }
+        if (src0->type == GGML_TYPE_F16) {
+            return ctx->device->pipeline_repeat_f16;
+        }
+        if (src0->type == GGML_TYPE_I32) {
+            return ctx->device->pipeline_repeat_i32;
         }
         return nullptr;
     case GGML_OP_REPEAT_BACK:
@@ -9429,12 +9489,29 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_sum_rows_f32;
         }
         return nullptr;
+    case GGML_OP_REDUCE_MEAN:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_reduce_mean_rows[0];
+        }
+        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+            return ctx->device->pipeline_reduce_mean_rows[1];
+        }
+        return nullptr;
     case GGML_OP_REDUCE_MAX:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_reduce_max_rows[0];
         }
         if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
             return ctx->device->pipeline_reduce_max_rows[1];
+        }
+        return nullptr;
+    case GGML_OP_GRU:
+        if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+            (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+            dst->type == GGML_TYPE_F32) {
+            const int x_idx = src0->type == GGML_TYPE_F32 ? 0 : 1;
+            const int w_idx = src1->type == GGML_TYPE_F32 ? 0 : 1;
+            return ctx->device->pipeline_gru[x_idx][w_idx];
         }
         return nullptr;
     case GGML_OP_CUMSUM:
@@ -9806,6 +9883,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { nr, 1, 1 };
             }
         } break;
+    case GGML_OP_REDUCE_MEAN:
     case GGML_OP_REDUCE_MAX:
         {
             const uint32_t nr = (uint32_t) ggml_nelements(dst);
@@ -9963,6 +10041,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_PAD:
     case GGML_OP_ROLL:
     case GGML_OP_REPEAT:
+    case GGML_OP_EXPAND:
     case GGML_OP_REPEAT_BACK:
     case GGML_OP_CPY:
     case GGML_OP_CONCAT:
@@ -11432,6 +11511,102 @@ static void ggml_vk_reduce_max(ggml_backend_vk_context * ctx, vk_context& subctx
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_REDUCE_MAX, p);
 }
 
+static void ggml_vk_reduce_mean(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    const int32_t axis = ggml_get_op_params_i32(dst, 0);
+    vk_op_reduce_max_push_constants p = vk_op_reduce_max_push_constants_init(src0, dst, axis);
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_REDUCE_MEAN, p);
+}
+
+static void ggml_vk_gru(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * r = dst->src[2];
+    const ggml_tensor * b = dst->src[3];
+    const ggml_tensor * h0 = dst->src[4];
+
+    GGML_ASSERT(x != nullptr && w != nullptr && r != nullptr);
+    GGML_ASSERT((x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16) &&
+                (r->type == GGML_TYPE_F32 || r->type == GGML_TYPE_F16));
+    GGML_ASSERT(w->type == r->type);
+    GGML_ASSERT(b == nullptr || b->type == w->type);
+    GGML_ASSERT(h0 == nullptr || h0->type == w->type);
+
+    const int32_t hidden_size = ggml_get_op_params_i32(dst, 0);
+    const int32_t linear_before_reset = ggml_get_op_params_i32(dst, 1);
+    const int32_t direction = ggml_get_op_params_i32(dst, 2);
+    const int32_t output_last = ggml_get_op_params_i32(dst, 3);
+
+    const int64_t seq_len = x->ne[2];
+    const int64_t batch = x->ne[1];
+    const int64_t input_size = x->ne[0];
+    const int64_t num_dir = w->ne[2];
+    const int64_t hidden = hidden_size > 0 ? hidden_size : (w->ne[1] / 3);
+
+    GGML_ASSERT(hidden > 0 && seq_len > 0 && batch > 0 && input_size > 0 && num_dir > 0);
+
+    const size_t x_type_size = ggml_type_size(x->type);
+    const size_t w_type_size = ggml_type_size(w->type);
+    const size_t scratch_size = (size_t) batch * (size_t) num_dir * (size_t) hidden * 4 * sizeof(float);
+
+    if (ctx->prealloc_size_x < scratch_size) {
+        ctx->prealloc_size_x = scratch_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const int x_idx = x->type == GGML_TYPE_F32 ? 0 : 1;
+    const int w_idx = w->type == GGML_TYPE_F32 ? 0 : 1;
+    vk_pipeline pipeline = ctx->device->pipeline_gru[x_idx][w_idx];
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w);
+    vk_subbuffer r_buf = ggml_vk_tensor_subbuffer(ctx, r);
+    vk_subbuffer b_buf = b ? ggml_vk_tensor_subbuffer(ctx, b) : x_buf;
+    vk_subbuffer h0_buf = h0 ? ggml_vk_tensor_subbuffer(ctx, h0) : x_buf;
+    vk_subbuffer s_buf = { ctx->prealloc_x, 0, scratch_size };
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    vk_op_gru_push_constants pc = {};
+    pc.seq_len = (uint32_t) seq_len;
+    pc.batch = (uint32_t) batch;
+    pc.input_size = (uint32_t) input_size;
+    pc.num_dir = (uint32_t) num_dir;
+    pc.hidden = (uint32_t) hidden;
+    pc.linear_before_reset = (uint32_t) linear_before_reset;
+    pc.direction = (uint32_t) direction;
+    pc.output_last = (uint32_t) output_last;
+    pc.has_bias = b != nullptr ? 1u : 0u;
+    pc.has_h0 = h0 != nullptr ? 1u : 0u;
+    pc.x_nb0 = (uint32_t) (x->nb[0] / x_type_size);
+    pc.x_nb1 = (uint32_t) (x->nb[1] / x_type_size);
+    pc.x_nb2 = (uint32_t) (x->nb[2] / x_type_size);
+    pc.w_nb0 = (uint32_t) (w->nb[0] / w_type_size);
+    pc.w_nb1 = (uint32_t) (w->nb[1] / w_type_size);
+    pc.w_nb2 = (uint32_t) (w->nb[2] / w_type_size);
+    pc.r_nb0 = (uint32_t) (r->nb[0] / w_type_size);
+    pc.r_nb1 = (uint32_t) (r->nb[1] / w_type_size);
+    pc.r_nb2 = (uint32_t) (r->nb[2] / w_type_size);
+    pc.b_nb0 = b ? (uint32_t) (b->nb[0] / w_type_size) : 0u;
+    pc.b_nb1 = b ? (uint32_t) (b->nb[1] / w_type_size) : 0u;
+    pc.h0_nb0 = h0 ? (uint32_t) (h0->nb[0] / w_type_size) : 0u;
+    pc.h0_nb1 = h0 ? (uint32_t) (h0->nb[1] / w_type_size) : 0u;
+    pc.h0_nb2 = h0 ? (uint32_t) (h0->nb[2] / w_type_size) : 0u;
+    pc.d_nb0 = (uint32_t) (dst->nb[0] / sizeof(float));
+    pc.d_nb1 = (uint32_t) (dst->nb[1] / sizeof(float));
+    pc.d_nb2 = (uint32_t) (dst->nb[2] / sizeof(float));
+    pc.d_nb3 = (uint32_t) (dst->nb[3] / sizeof(float));
+    pc.scratch_stride = (uint32_t) (4 * hidden);
+
+    std::array<uint32_t, 3> elements = { (uint32_t) batch, (uint32_t) num_dir, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, r_buf, b_buf, h0_buf, s_buf, d_buf }, pc, elements);
+    ctx->prealloc_x_need_sync = true;
+}
+
 static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     vk_op_sum_rows_push_constants pc = vk_op_sum_rows_push_constants_init(src0, dst, src0->ne[0]);
     // Use the single pass shader when the rows are small or there are enough rows to fill the GPU.
@@ -12689,6 +12864,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
+static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
@@ -12839,7 +13015,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
-
+        break;
+    case GGML_OP_EXPAND:
+        ggml_vk_repeat(ctx, compute_ctx, src0, node);
         break;
     case GGML_OP_REPEAT_BACK:
         ggml_vk_repeat_back(ctx, compute_ctx, src0, node);
@@ -13082,8 +13260,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_REDUCE_MEAN:
+        ggml_vk_reduce_mean(ctx, compute_ctx, src0, node);
+
+        break;
     case GGML_OP_REDUCE_MAX:
         ggml_vk_reduce_max(ctx, compute_ctx, src0, node);
+
+        break;
+    case GGML_OP_GRU:
+        ggml_vk_gru(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_ARGMAX:
@@ -15345,7 +15531,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return false;
             }
         case GGML_OP_REPEAT:
-            return ggml_type_size(op->type) == sizeof(float) && ggml_type_size(op->src[0]->type) == sizeof(float);
+        case GGML_OP_EXPAND:
+            return op->src[0]->type == op->type &&
+                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_I32);
         case GGML_OP_REPEAT_BACK:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_ROPE:
@@ -15491,6 +15679,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_REDUCE_MEAN:
+            {
+                const int32_t axis = ggml_get_op_params_i32(op, 0);
+                if (axis < 0 || axis >= GGML_MAX_DIMS) {
+                    return false;
+                }
+
+                bool shape_ok = true;
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    if (i == axis) {
+                        shape_ok = shape_ok && op->ne[i] == 1;
+                    } else {
+                        shape_ok = shape_ok && op->ne[i] == op->src[0]->ne[i];
+                    }
+                }
+
+                return shape_ok &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                    op->src[0]->type == op->type;
+            }
         case GGML_OP_REDUCE_MAX:
             {
                 const int32_t axis = ggml_get_op_params_i32(op, 0);
@@ -15510,6 +15718,82 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return shape_ok &&
                     (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                     op->src[0]->type == op->type;
+            }
+        case GGML_OP_GRU:
+            {
+                const ggml_tensor * x = op->src[0];
+                const ggml_tensor * w = op->src[1];
+                const ggml_tensor * r = op->src[2];
+                const ggml_tensor * b = op->src[3];
+                const ggml_tensor * h0 = op->src[4];
+                if (x == nullptr || w == nullptr || r == nullptr) {
+                    return false;
+                }
+
+                if (!((x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+                      (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16) &&
+                      (r->type == GGML_TYPE_F32 || r->type == GGML_TYPE_F16))) {
+                    return false;
+                }
+                if (b != nullptr && !(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16)) {
+                    return false;
+                }
+                if (h0 != nullptr && !(h0->type == GGML_TYPE_F32 || h0->type == GGML_TYPE_F16)) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // Vulkan GRU shader variants require W/R (and optional B/H0) to share a type.
+                if (!(w->type == r->type &&
+                      (b == nullptr || b->type == w->type) &&
+                      (h0 == nullptr || h0->type == w->type))) {
+                    return false;
+                }
+
+                const int32_t hidden_size = ggml_get_op_params_i32(op, 0);
+                const int32_t linear_before_reset = ggml_get_op_params_i32(op, 1);
+                const int32_t direction = ggml_get_op_params_i32(op, 2);
+                const int32_t output_last = ggml_get_op_params_i32(op, 3);
+
+                if (!(linear_before_reset == 0 || linear_before_reset == 1)) {
+                    return false;
+                }
+                if (!(direction == GGML_GRU_FORWARD || direction == GGML_GRU_REVERSE || direction == GGML_GRU_BIDIRECTIONAL)) {
+                    return false;
+                }
+                if (!(output_last == 0 || output_last == 1)) {
+                    return false;
+                }
+
+                const int64_t hidden = hidden_size > 0 ? hidden_size : (w->ne[1] / 3);
+                const int64_t batch = x->ne[1];
+                const int64_t seq_len = x->ne[2];
+                const int64_t num_dir = w->ne[2];
+
+                if (hidden <= 0 || batch <= 0 || seq_len <= 0 || num_dir <= 0) {
+                    return false;
+                }
+                if (w->ne[1] != 3 * hidden || r->ne[1] != 3 * hidden || r->ne[0] != hidden || r->ne[2] != num_dir) {
+                    return false;
+                }
+                if (b != nullptr && (b->ne[0] != 6 * hidden || b->ne[1] != num_dir)) {
+                    return false;
+                }
+                if (h0 != nullptr && (h0->ne[0] != hidden || h0->ne[1] != batch || h0->ne[2] != num_dir)) {
+                    return false;
+                }
+                if (direction == GGML_GRU_BIDIRECTIONAL && num_dir != 2) {
+                    return false;
+                }
+                if ((direction == GGML_GRU_FORWARD || direction == GGML_GRU_REVERSE) && num_dir != 1) {
+                    return false;
+                }
+
+                if (output_last == 0) {
+                    return op->ne[0] == hidden && op->ne[1] == batch && op->ne[2] == num_dir && op->ne[3] == seq_len;
+                }
+                return op->ne[0] == hidden && op->ne[1] == batch && op->ne[2] == num_dir;
             }
         case GGML_OP_CUMSUM:
             {
@@ -16171,6 +16455,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                                                 tensor->op_params[4], tensor->op_params[5], tensor->op_params[6], tensor->op_params[7]);
         } else if (tensor->op == GGML_OP_REPEAT) {
             tensor_clone = ggml_repeat(ggml_ctx, src_clone[0], tensor);
+        } else if (tensor->op == GGML_OP_EXPAND) {
+            tensor_clone = ggml_expand(ggml_ctx, src_clone[0], tensor);
         } else if (tensor->op == GGML_OP_REPEAT_BACK) {
             tensor_clone = ggml_repeat_back(ggml_ctx, src_clone[0], tensor);
         } else if (tensor->op == GGML_OP_ADD) {
@@ -16339,8 +16625,18 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_cumsum(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_MEAN) {
             tensor_clone = ggml_mean(ggml_ctx, src_clone[0]);
+        } else if (tensor->op == GGML_OP_REDUCE_MEAN) {
+            tensor_clone = ggml_reduce_mean(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_REDUCE_MAX) {
             tensor_clone = ggml_reduce_max(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
+        } else if (tensor->op == GGML_OP_GRU) {
+            const int32_t hidden_size = ggml_get_op_params_i32(tensor, 0);
+            const int32_t linear_before_reset = ggml_get_op_params_i32(tensor, 1);
+            const int32_t direction = ggml_get_op_params_i32(tensor, 2);
+            const int32_t output_last = ggml_get_op_params_i32(tensor, 3);
+            tensor_clone = output_last == 0
+                ? ggml_gru(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4], hidden_size, linear_before_reset, direction)
+                : ggml_gru_last(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4], hidden_size, linear_before_reset, direction);
         } else if (tensor->op == GGML_OP_ARGMAX) {
             tensor_clone = ggml_argmax(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_COUNT_EQUAL) {

@@ -1,3 +1,4 @@
+#include "mini2gguf/crnn_utils.hpp"
 #include "mini2gguf/model_runtime.hpp"
 #include "mini2gguf/yolo_utils.hpp"
 
@@ -498,11 +499,21 @@ int main(int argc, char ** argv) {
         return 3;
     }
 
+    const std::string family = detect_model_family(model, opts.model_name);
+    const int version = detect_model_version(model, opts.model_name);
+
+    std::cout << "model.family=" << (family.empty() ? "unknown" : family)
+              << " model.version=" << (version >= 0 ? std::to_string(version) : "unknown") << std::endl;
+
     int net_w = 416;
     int net_h = 416;
     if (input_infos[0].dims.size() >= 4) {
         net_h = static_cast<int>(input_infos[0].dims[2]);
         net_w = static_cast<int>(input_infos[0].dims[3]);
+    }
+    if (net_h <= 0 || net_w <= 0) {
+        std::cerr << "invalid input shape for model input[0]: " << dims_to_string(input_infos[0].dims) << std::endl;
+        return 3;
     }
 
     yolo_image img;
@@ -510,9 +521,28 @@ int main(int argc, char ** argv) {
         std::cerr << "failed to load image: " << opts.image_path << std::endl;
         return 4;
     }
-    yolo_image sized = letterbox_image(img, net_w, net_h);
 
-    std::vector<float> input = sized.data;
+    std::vector<float> input;
+    if (family == "crnn") {
+        std::string preprocess_error;
+        mini2gguf::CrnnPreprocessOptions pp;
+        if (!mini2gguf::preprocess_crnn_input(
+                img.data.data(),
+                img.w,
+                img.h,
+                img.c,
+                input_infos[0],
+                input,
+                preprocess_error,
+                pp)) {
+            std::cerr << "CRNN preprocess failed: " << preprocess_error << std::endl;
+            return 4;
+        }
+    } else {
+        yolo_image sized = letterbox_image(img, net_w, net_h);
+        input = sized.data;
+    }
+
     std::vector<std::vector<float>> outputs;
     if (!model.infer_all(input, outputs)) {
         std::cerr << "infer failed: " << model.last_error() << std::endl;
@@ -543,17 +573,13 @@ int main(int argc, char ** argv) {
 
     std::vector<detection> detections;
     std::string postprocess_error;
-    const std::string family = detect_model_family(model, opts.model_name);
-    const int version = detect_model_version(model, opts.model_name);
-
-    std::cout << "model.family=" << (family.empty() ? "unknown" : family)
-              << " model.version=" << (version >= 0 ? std::to_string(version) : "unknown") << std::endl;
-    std::cout << "postprocess: conf_thres=" << opts.conf_thres
-              << " iou_thres=" << opts.iou_thres
-              << " agnostic_nms=" << (opts.agnostic_nms ? "true" : "false")
-              << std::endl;
 
     if (family == "yolo") {
+        std::cout << "postprocess: conf_thres=" << opts.conf_thres
+                  << " iou_thres=" << opts.iou_thres
+                  << " agnostic_nms=" << (opts.agnostic_nms ? "true" : "false")
+                  << std::endl;
+
         mini2gguf::YoloPostprocessOptions pp;
         pp.image_w = img.w;
         pp.image_h = img.h;
@@ -568,6 +594,23 @@ int main(int argc, char ** argv) {
             std::cerr << "postprocess failed: " << postprocess_error << std::endl;
             return 6;
         }
+    } else if (family == "crnn") {
+        std::vector<std::string> dict;
+        const std::string dict_metadata = model.model_metadata_value("model.dict");
+        if (!mini2gguf::parse_crnn_dict_metadata(dict_metadata, dict)) {
+            std::cerr << "postprocess failed: missing or empty model.dict metadata for CRNN model" << std::endl;
+            return 6;
+        }
+
+        std::string crnn_text;
+        mini2gguf::CrnnPostprocessOptions pp;
+        if (!mini2gguf::postprocess_crnn_outputs(outputs, output_infos, dict, crnn_text, postprocess_error, pp)) {
+            std::cerr << "postprocess failed: " << postprocess_error << std::endl;
+            return 6;
+        }
+
+        std::cout << "crnn.text=" << crnn_text << std::endl;
+        return 0;
     } else {
         std::cerr << "postprocess failed: unsupported model family: "
                   << (family.empty() ? "unknown" : family) << std::endl;

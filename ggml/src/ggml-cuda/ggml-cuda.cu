@@ -37,6 +37,7 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/reduce-mean.cuh"
 #include "ggml-cuda/reduce-max.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
@@ -62,6 +63,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/gru.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -73,6 +75,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -2440,6 +2443,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_REPEAT:
             ggml_cuda_op_repeat(ctx, dst);
             break;
+        case GGML_OP_EXPAND:
+            ggml_cuda_op_repeat(ctx, dst);
+            break;
         case GGML_OP_REPEAT_BACK:
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
@@ -2714,8 +2720,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MEAN:
             ggml_cuda_op_mean(ctx, dst);
             break;
+        case GGML_OP_REDUCE_MEAN:
+            ggml_cuda_op_reduce_mean(ctx, dst);
+            break;
         case GGML_OP_REDUCE_MAX:
             ggml_cuda_op_reduce_max(ctx, dst);
+            break;
+        case GGML_OP_GRU:
+            ggml_cuda_op_gru(ctx, dst);
             break;
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
@@ -4769,6 +4781,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return true;
             } break;
         case GGML_OP_REPEAT:
+        case GGML_OP_EXPAND:
             {
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type == GGML_TYPE_F32 ||
@@ -4889,6 +4902,26 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MEAN:
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_REDUCE_MEAN:
+            {
+                const int32_t axis = ggml_get_op_params_i32(op, 0);
+                if (axis < 0 || axis >= GGML_MAX_DIMS) {
+                    return false;
+                }
+
+                bool shape_ok = true;
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    if (i == axis) {
+                        shape_ok = shape_ok && op->ne[i] == 1;
+                    } else {
+                        shape_ok = shape_ok && op->ne[i] == op->src[0]->ne[i];
+                    }
+                }
+
+                return shape_ok &&
+                    (op->src[0]->type == op->type) &&
+                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+            }
         case GGML_OP_REDUCE_MAX:
             {
                 const int32_t axis = ggml_get_op_params_i32(op, 0);
@@ -4908,6 +4941,82 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return shape_ok &&
                     (op->src[0]->type == op->type) &&
                     (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+            }
+        case GGML_OP_GRU:
+            {
+                const ggml_tensor * x = op->src[0];
+                const ggml_tensor * w = op->src[1];
+                const ggml_tensor * r = op->src[2];
+                const ggml_tensor * b = op->src[3];
+                const ggml_tensor * h0 = op->src[4];
+                if (x == nullptr || w == nullptr || r == nullptr) {
+                    return false;
+                }
+
+                if (!((x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) &&
+                      (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16) &&
+                      (r->type == GGML_TYPE_F32 || r->type == GGML_TYPE_F16))) {
+                    return false;
+                }
+                if (b != nullptr && !(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16)) {
+                    return false;
+                }
+                if (h0 != nullptr && !(h0->type == GGML_TYPE_F32 || h0->type == GGML_TYPE_F16)) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+
+                const int32_t hidden_size = ggml_get_op_params_i32(op, 0);
+                const int32_t linear_before_reset = ggml_get_op_params_i32(op, 1);
+                const int32_t direction = ggml_get_op_params_i32(op, 2);
+                const int32_t output_last = ggml_get_op_params_i32(op, 3);
+
+                if (!(linear_before_reset == 0 || linear_before_reset == 1)) {
+                    return false;
+                }
+                if (!(direction == GGML_GRU_FORWARD || direction == GGML_GRU_REVERSE || direction == GGML_GRU_BIDIRECTIONAL)) {
+                    return false;
+                }
+                if (!(output_last == 0 || output_last == 1)) {
+                    return false;
+                }
+
+                const int64_t hidden = hidden_size > 0 ? hidden_size : (w->ne[1] / 3);
+                const int64_t batch = x->ne[1];
+                const int64_t seq_len = x->ne[2];
+                const int64_t num_dir = w->ne[2];
+
+                if (hidden <= 0 || batch <= 0 || seq_len <= 0 || num_dir <= 0) {
+                    return false;
+                }
+                if (w->ne[1] != 3 * hidden || r->ne[1] != 3 * hidden || r->ne[0] != hidden || r->ne[2] != num_dir) {
+                    return false;
+                }
+                if (b != nullptr && (b->ne[0] != 6 * hidden || b->ne[1] != num_dir)) {
+                    return false;
+                }
+                if (h0 != nullptr && (h0->ne[0] != hidden || h0->ne[1] != batch || h0->ne[2] != num_dir)) {
+                    return false;
+                }
+                if (direction == GGML_GRU_BIDIRECTIONAL && num_dir != 2) {
+                    return false;
+                }
+                if ((direction == GGML_GRU_FORWARD || direction == GGML_GRU_REVERSE) && num_dir != 1) {
+                    return false;
+                }
+
+                // The CUDA implementation keeps 4 * hidden floats in shared memory.
+                // With the 48 KiB baseline shared memory budget this caps hidden to 3072.
+                if (hidden > 3072) {
+                    return false;
+                }
+
+                if (output_last == 0) {
+                    return op->ne[0] == hidden && op->ne[1] == batch && op->ne[2] == num_dir && op->ne[3] == seq_len;
+                }
+                return op->ne[0] == hidden && op->ne[1] == batch && op->ne[2] == num_dir;
             }
         case GGML_OP_PAD:
             return true;

@@ -823,6 +823,8 @@ void process_shaders() {
     string_to_spv("gather_elements_f16_i64", "gather_elements.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "int64_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
 
     string_to_spv("repeat_f32", "repeat.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("repeat_f16", "repeat.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
+    string_to_spv("repeat_i32", "repeat.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
     string_to_spv("repeat_back_f32", "repeat_back.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
     string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
@@ -964,8 +966,14 @@ void process_shaders() {
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("reduce_mean_rows_f32", "reduce_mean_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
+    string_to_spv("reduce_mean_rows_f16", "reduce_mean_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}}));
     string_to_spv("reduce_max_rows_f32", "reduce_max_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}}));
     string_to_spv("reduce_max_rows_f16", "reduce_max_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}}));
+    string_to_spv("gru_xf32_wf32", "gru.comp", merge_maps(base_dict, {{"X_TYPE", "float"}, {"W_TYPE", "float"}}));
+    string_to_spv("gru_xf32_wf16", "gru.comp", merge_maps(base_dict, {{"X_TYPE", "float"}, {"W_TYPE", "float16_t"}}));
+    string_to_spv("gru_xf16_wf32", "gru.comp", merge_maps(base_dict, {{"X_TYPE", "float16_t"}, {"W_TYPE", "float"}}));
+    string_to_spv("gru_xf16_wf16", "gru.comp", merge_maps(base_dict, {{"X_TYPE", "float16_t"}, {"W_TYPE", "float16_t"}}));
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

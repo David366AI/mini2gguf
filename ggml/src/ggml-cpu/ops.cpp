@@ -12,6 +12,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -1557,6 +1558,70 @@ void ggml_compute_forward_mean(
     }
 }
 
+// ggml_compute_forward_reduce_mean
+
+static void ggml_compute_forward_reduce_mean_impl(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == src0->type);
+
+    const int32_t axis = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (d == axis) {
+            GGML_ASSERT(dst->ne[d] == 1);
+        } else {
+            GGML_ASSERT(dst->ne[d] == src0->ne[d]);
+        }
+    }
+
+    const int64_t reduce_ne = src0->ne[axis];
+    GGML_ASSERT(reduce_ne > 0);
+
+    const int64_t out_ne0 = dst->ne[0];
+    const int64_t out_ne1 = dst->ne[1];
+    const int64_t out_ne2 = dst->ne[2];
+    const int64_t out_ne3 = dst->ne[3];
+    const int64_t out_total = ggml_nelements(dst);
+
+    for (int64_t i = 0; i < out_total; ++i) {
+        int64_t rem = i;
+
+        const int64_t i0 = rem % out_ne0;
+        rem /= out_ne0;
+        const int64_t i1 = rem % out_ne1;
+        rem /= out_ne1;
+        const int64_t i2 = rem % out_ne2;
+        rem /= out_ne2;
+        const int64_t i3 = rem % out_ne3;
+
+        int64_t coord[4] = { i0, i1, i2, i3 };
+
+        float sum = 0.0f;
+        for (int64_t r = 0; r < reduce_ne; ++r) {
+            coord[axis] = r;
+            sum += ggml_get_f32_nd(src0, coord[0], coord[1], coord[2], coord[3]);
+        }
+
+        ggml_set_f32_nd(dst, i0, i1, i2, i3, sum / (float) reduce_ne);
+    }
+}
+
+void ggml_compute_forward_reduce_mean(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_reduce_mean_impl(params, dst);
+}
+
 // ggml_compute_forward_reduce_max
 
 template <typename T>
@@ -1665,6 +1730,187 @@ void ggml_compute_forward_reduce_max(
                 GGML_ABORT("fatal error");
             }
     }
+}
+
+// ggml_compute_forward_gru
+
+static inline float ggml_cpu_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static void ggml_compute_forward_gru_impl(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * r = dst->src[2];
+    const ggml_tensor * b = dst->src[3];
+    const ggml_tensor * initial_h = dst->src[4];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(x != nullptr && w != nullptr && r != nullptr);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16);
+    GGML_ASSERT(r->type == GGML_TYPE_F32 || r->type == GGML_TYPE_F16);
+    GGML_ASSERT(b == nullptr || b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
+    GGML_ASSERT(initial_h == nullptr || initial_h->type == GGML_TYPE_F32 || initial_h->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t hidden_size = ggml_get_op_params_i32(dst, 0);
+    const int32_t linear_before_reset = ggml_get_op_params_i32(dst, 1);
+    const int32_t direction = ggml_get_op_params_i32(dst, 2);
+    const int32_t output_last = ggml_get_op_params_i32(dst, 3);
+
+    GGML_ASSERT(linear_before_reset == 0 || linear_before_reset == 1);
+    GGML_ASSERT(output_last == 0 || output_last == 1);
+    GGML_ASSERT(direction == GGML_GRU_FORWARD || direction == GGML_GRU_REVERSE || direction == GGML_GRU_BIDIRECTIONAL);
+
+    const int64_t seq_len    = x->ne[2];
+    const int64_t batch      = x->ne[1];
+    const int64_t input_size = x->ne[0];
+    const int64_t num_dir    = w->ne[2];
+    const int64_t hidden     = hidden_size > 0 ? (int64_t) hidden_size : (w->ne[1] / 3);
+
+    GGML_ASSERT(seq_len > 0 && batch > 0 && input_size > 0 && num_dir > 0 && hidden > 0);
+    GGML_ASSERT(w->ne[0] == input_size && w->ne[1] == 3 * hidden);
+    GGML_ASSERT(r->ne[0] == hidden && r->ne[1] == 3 * hidden && r->ne[2] == num_dir);
+    if (b != nullptr) {
+        GGML_ASSERT(b->ne[0] == 6 * hidden && b->ne[1] == num_dir);
+    }
+    if (initial_h != nullptr) {
+        GGML_ASSERT(initial_h->ne[0] == hidden && initial_h->ne[1] == batch && initial_h->ne[2] == num_dir);
+    }
+    if (direction == GGML_GRU_BIDIRECTIONAL) {
+        GGML_ASSERT(num_dir == 2);
+    } else {
+        GGML_ASSERT(num_dir == 1);
+    }
+
+    if (output_last == 0) {
+        GGML_ASSERT(dst->ne[0] == hidden && dst->ne[1] == batch && dst->ne[2] == num_dir && dst->ne[3] == seq_len);
+    } else {
+        GGML_ASSERT(dst->ne[0] == hidden && dst->ne[1] == batch && dst->ne[2] == num_dir);
+    }
+
+    std::vector<float> h_prev((size_t) batch * (size_t) hidden);
+    std::vector<float> h_cur((size_t) batch * (size_t) hidden);
+    std::vector<float> z_gate((size_t) hidden);
+    std::vector<float> r_gate((size_t) hidden);
+
+    for (int64_t d = 0; d < num_dir; ++d) {
+        const bool reverse_dir =
+            direction == GGML_GRU_REVERSE ||
+            (direction == GGML_GRU_BIDIRECTIONAL && d == 1);
+
+        if (initial_h != nullptr) {
+            for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
+                for (int64_t h = 0; h < hidden; ++h) {
+                    h_prev[(size_t) b_idx * (size_t) hidden + (size_t) h] = ggml_get_f32_nd(initial_h, h, b_idx, d, 0);
+                }
+            }
+        } else {
+            std::fill(h_prev.begin(), h_prev.end(), 0.0f);
+        }
+
+        for (int64_t step = 0; step < seq_len; ++step) {
+            const int64_t t_in = reverse_dir ? (seq_len - 1 - step) : step;
+            const int64_t t_out = reverse_dir ? (seq_len - 1 - step) : step;
+
+            for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
+                float * h_prev_row = h_prev.data() + (size_t) b_idx * (size_t) hidden;
+                float * h_cur_row  = h_cur.data()  + (size_t) b_idx * (size_t) hidden;
+
+                for (int64_t h = 0; h < hidden; ++h) {
+                    const int64_t z_off = h;
+                    const int64_t r_off = hidden + h;
+
+                    float z_pre = 0.0f;
+                    float r_pre = 0.0f;
+
+                    for (int64_t i = 0; i < input_size; ++i) {
+                        const float x_i = ggml_get_f32_nd(x, i, b_idx, t_in, 0);
+                        z_pre += ggml_get_f32_nd(w, i, z_off, d, 0) * x_i;
+                        r_pre += ggml_get_f32_nd(w, i, r_off, d, 0) * x_i;
+                    }
+
+                    for (int64_t j = 0; j < hidden; ++j) {
+                        const float h_j = h_prev_row[j];
+                        z_pre += ggml_get_f32_nd(r, j, z_off, d, 0) * h_j;
+                        r_pre += ggml_get_f32_nd(r, j, r_off, d, 0) * h_j;
+                    }
+
+                    if (b != nullptr) {
+                        z_pre += ggml_get_f32_nd(b, h, d, 0, 0) + ggml_get_f32_nd(b, 3 * hidden + h, d, 0, 0);
+                        r_pre += ggml_get_f32_nd(b, hidden + h, d, 0, 0) + ggml_get_f32_nd(b, 4 * hidden + h, d, 0, 0);
+                    }
+
+                    z_gate[(size_t) h] = ggml_cpu_sigmoid(z_pre);
+                    r_gate[(size_t) h] = ggml_cpu_sigmoid(r_pre);
+                }
+
+                for (int64_t h = 0; h < hidden; ++h) {
+                    const int64_t h_off = 2 * hidden + h;
+                    float n_pre = 0.0f;
+
+                    for (int64_t i = 0; i < input_size; ++i) {
+                        const float x_i = ggml_get_f32_nd(x, i, b_idx, t_in, 0);
+                        n_pre += ggml_get_f32_nd(w, i, h_off, d, 0) * x_i;
+                    }
+                    if (b != nullptr) {
+                        n_pre += ggml_get_f32_nd(b, 2 * hidden + h, d, 0, 0);
+                    }
+
+                    if (linear_before_reset == 1) {
+                        float rec = 0.0f;
+                        for (int64_t j = 0; j < hidden; ++j) {
+                            rec += ggml_get_f32_nd(r, j, h_off, d, 0) * h_prev_row[j];
+                        }
+                        if (b != nullptr) {
+                            rec += ggml_get_f32_nd(b, 5 * hidden + h, d, 0, 0);
+                        }
+                        n_pre += r_gate[(size_t) h] * rec;
+                    } else {
+                        float rec = 0.0f;
+                        for (int64_t j = 0; j < hidden; ++j) {
+                            rec += ggml_get_f32_nd(r, j, h_off, d, 0) * (r_gate[(size_t) j] * h_prev_row[j]);
+                        }
+                        if (b != nullptr) {
+                            rec += ggml_get_f32_nd(b, 5 * hidden + h, d, 0, 0);
+                        }
+                        n_pre += rec;
+                    }
+
+                    const float n_t = tanhf(n_pre);
+                    const float h_t = n_t + z_gate[(size_t) h] * (h_prev_row[h] - n_t);
+                    h_cur_row[h] = h_t;
+
+                    if (output_last == 0) {
+                        ggml_set_f32_nd(dst, h, b_idx, d, t_out, h_t);
+                    }
+                }
+            }
+
+            h_prev.swap(h_cur);
+        }
+
+        if (output_last == 1) {
+            for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
+                const float * h_prev_row = h_prev.data() + (size_t) b_idx * (size_t) hidden;
+                for (int64_t h = 0; h < hidden; ++h) {
+                    ggml_set_f32_nd(dst, h, b_idx, d, 0, h_prev_row[h]);
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_gru(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_gru_impl(params, dst);
 }
 
 // ggml_compute_forward_argmax

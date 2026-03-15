@@ -963,10 +963,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SUM_ROWS",
     "CUMSUM",
     "MEAN",
+    "REDUCE_MEAN",
     "REDUCE_MAX",
     "ARGMAX",
     "COUNT_EQUAL",
     "REPEAT",
+    "EXPAND",
     "REPEAT_BACK",
     "CONCAT",
     "SILU_BACK",
@@ -975,6 +977,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
+    "GRU",
 
     "MUL_MAT",
     "MUL_MAT_ID",
@@ -1051,7 +1054,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1075,10 +1078,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "Σx_k",
     "cumsum(x)",
     "Σx/n",
+    "mean(x)_k",
     "max(x)_k",
     "argmax(x)",
     "count_equal(x)",
     "repeat(x)",
+    "expand(x)",
     "repeat_back(x)",
     "concat(x, y)",
     "silu_back(x)",
@@ -1087,6 +1092,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
+    "gru(x)",
 
     "X*Y",
     "X[i]*Y",
@@ -1163,7 +1169,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1522,6 +1528,17 @@ bool ggml_can_repeat(const struct ggml_tensor * t0, const struct ggml_tensor * t
         (t1->ne[1]%t0->ne[1] == 0) &&
         (t1->ne[2]%t0->ne[2] == 0) &&
         (t1->ne[3]%t0->ne[3] == 0);
+}
+
+// check if t0 can be expanded to t1 by broadcasting (equal or 1 on every dim)
+static inline bool ggml_can_expand(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+    static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
+
+    return ggml_is_empty(t0) ? ggml_is_empty(t1) :
+        ((t0->ne[0] == 1 || t0->ne[0] == t1->ne[0])) &&
+        ((t0->ne[1] == 1 || t0->ne[1] == t1->ne[1])) &&
+        ((t0->ne[2] == 1 || t0->ne[2] == t1->ne[2])) &&
+        ((t0->ne[3] == 1 || t0->ne[3] == t1->ne[3]));
 }
 
 static inline bool ggml_can_repeat_rows(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -2527,6 +2544,233 @@ struct ggml_tensor * ggml_mean(
     return result;
 }
 
+struct ggml_tensor * ggml_reduce_mean(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+                       int32_t axis) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+
+    int64_t ne[4] = { a->ne[0], a->ne[1], a->ne[2], a->ne[3] };
+    ne[axis] = 1;
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, ne);
+
+    result->op     = GGML_OP_REDUCE_MEAN;
+    result->src[0] = a;
+    ggml_set_op_params_i32(result, 0, axis);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_reduce_mean_onnx(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+                       int32_t axis_onnx,
+                       int32_t rank,
+                          bool keepdims) {
+    GGML_ASSERT(rank >= 1 && rank <= 4);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+
+    int axis = axis_onnx;
+    if (axis < 0) {
+        axis += rank;
+    }
+    GGML_ASSERT(axis >= 0 && axis < rank);
+    const int axis_ggml = rank - 1 - axis;
+
+    struct ggml_tensor * y = ggml_reduce_mean(ctx, a, axis_ggml);
+
+    if (!keepdims) {
+        int64_t ne[4] = { y->ne[0], y->ne[1], y->ne[2], y->ne[3] };
+        int64_t squeezed[3];
+        int n_sq = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (i != axis_ggml) {
+                squeezed[n_sq++] = ne[i];
+            }
+        }
+
+        if (n_sq == 0) {
+            y = ggml_reshape_1d(ctx, y, 1);
+        } else if (n_sq == 1) {
+            y = ggml_reshape_1d(ctx, y, squeezed[0]);
+        } else if (n_sq == 2) {
+            y = ggml_reshape_2d(ctx, y, squeezed[0], squeezed[1]);
+        } else {
+            y = ggml_reshape_3d(ctx, y, squeezed[0], squeezed[1], squeezed[2]);
+        }
+    }
+
+    return y;
+}
+
+static struct ggml_tensor * ggml_gru_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * initial_h,
+                       int32_t hidden_size,
+                       int32_t linear_before_reset,
+                       int32_t direction,
+                          bool output_last) {
+    GGML_ASSERT(ctx != NULL);
+    GGML_ASSERT(x != NULL && w != NULL && r != NULL);
+    GGML_ASSERT(x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32);
+    GGML_ASSERT(r->type == GGML_TYPE_F16 || r->type == GGML_TYPE_F32);
+    GGML_ASSERT(b == NULL || b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F32);
+    GGML_ASSERT(initial_h == NULL || initial_h->type == GGML_TYPE_F16 || initial_h->type == GGML_TYPE_F32);
+    GGML_ASSERT(linear_before_reset == 0 || linear_before_reset == 1);
+    GGML_ASSERT(direction == GGML_GRU_FORWARD || direction == GGML_GRU_REVERSE || direction == GGML_GRU_BIDIRECTIONAL);
+
+    const int64_t seq_len    = x->ne[2];
+    const int64_t batch      = x->ne[1];
+    const int64_t input_size = x->ne[0];
+    const int64_t num_dir    = w->ne[2];
+    const int64_t hidden     = hidden_size > 0 ? (int64_t) hidden_size : (w->ne[1] / 3);
+
+    GGML_ASSERT(seq_len > 0 && batch > 0 && input_size > 0 && num_dir > 0 && hidden > 0);
+    GGML_ASSERT(w->ne[1] == 3 * hidden && w->ne[0] == input_size);
+    GGML_ASSERT(r->ne[1] == 3 * hidden && r->ne[0] == hidden && r->ne[2] == num_dir);
+    if (b != NULL) {
+        GGML_ASSERT(b->ne[0] == 6 * hidden && b->ne[1] == num_dir);
+    }
+    if (initial_h != NULL) {
+        GGML_ASSERT(initial_h->ne[0] == hidden && initial_h->ne[1] == batch && initial_h->ne[2] == num_dir);
+    }
+    if (direction == GGML_GRU_BIDIRECTIONAL) {
+        GGML_ASSERT(num_dir == 2);
+    } else {
+        GGML_ASSERT(num_dir == 1);
+    }
+
+    struct ggml_tensor * result = NULL;
+    if (output_last) {
+        result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, batch, num_dir);
+    } else {
+        int64_t ne[4] = { hidden, batch, num_dir, seq_len };
+        result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    }
+    result->op     = GGML_OP_GRU;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = r;
+    result->src[3] = b;
+    result->src[4] = initial_h;
+    ggml_set_op_params_i32(result, 0, hidden_size);
+    ggml_set_op_params_i32(result, 1, linear_before_reset);
+    ggml_set_op_params_i32(result, 2, direction);
+    ggml_set_op_params_i32(result, 3, output_last ? 1 : 0);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gru(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * initial_h,
+                       int32_t hidden_size,
+                       int32_t linear_before_reset,
+                       int32_t direction) {
+    return ggml_gru_impl(ctx, x, w, r, b, initial_h, hidden_size, linear_before_reset, direction, false);
+}
+
+struct ggml_tensor * ggml_gru_last(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * initial_h,
+                       int32_t hidden_size,
+                       int32_t linear_before_reset,
+                       int32_t direction) {
+    return ggml_gru_impl(ctx, x, w, r, b, initial_h, hidden_size, linear_before_reset, direction, true);
+}
+
+struct ggml_tensor * ggml_gru_onnx(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * initial_h,
+                       int32_t hidden_size,
+                       int32_t linear_before_reset,
+                       int32_t direction,
+        struct ggml_tensor ** y_h_out) {
+    const int64_t expected_input_size = w->ne[0];
+    if (x->ne[0] != expected_input_size) {
+        int axis_input = -1;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (x->ne[axis] == expected_input_size) {
+                axis_input = axis;
+                break;
+            }
+        }
+
+        if (axis_input >= 0) {
+            int axis_batch = -1;
+            const int64_t batch_hint = initial_h != NULL ? initial_h->ne[1] : -1;
+
+            if (batch_hint > 0) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (axis != axis_input && x->ne[axis] == batch_hint) {
+                        axis_batch = axis;
+                        break;
+                    }
+                }
+            }
+            if (axis_batch < 0) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (axis != axis_input && x->ne[axis] == 1) {
+                        axis_batch = axis;
+                        break;
+                    }
+                }
+            }
+            if (axis_batch < 0) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (axis != axis_input) {
+                        axis_batch = axis;
+                        break;
+                    }
+                }
+            }
+
+            int axis_seq = -1;
+            for (int axis = 0; axis < 3; ++axis) {
+                if (axis != axis_input && axis != axis_batch) {
+                    axis_seq = axis;
+                    break;
+                }
+            }
+
+            if (axis_seq >= 0) {
+                int to_dst[4] = { 0, 1, 2, 3 };
+                to_dst[axis_input] = 0;
+                to_dst[axis_batch] = 1;
+                to_dst[axis_seq] = 2;
+                x = ggml_permute(ctx, x, to_dst[0], to_dst[1], to_dst[2], to_dst[3]);
+                if (!ggml_is_contiguous(x)) {
+                    x = ggml_cont(ctx, x);
+                }
+            }
+        }
+    }
+
+    struct ggml_tensor * y = ggml_gru(ctx, x, w, r, b, initial_h, hidden_size, linear_before_reset, direction);
+    if (y_h_out != NULL) {
+        *y_h_out = ggml_gru_last(ctx, x, w, r, b, initial_h, hidden_size, linear_before_reset, direction);
+    }
+    return y;
+}
+
 // ggml_reduce_max
 
 struct ggml_tensor * ggml_reduce_max(
@@ -2611,6 +2855,43 @@ struct ggml_tensor * ggml_repeat_4d(
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
 
     result->op     = GGML_OP_REPEAT;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_expand
+
+struct ggml_tensor * ggml_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(ggml_can_expand(a, b));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, b->ne);
+
+    result->op     = GGML_OP_EXPAND;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_expand_4d(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+    const int64_t ne[GGML_MAX_DIMS] = { ne0, ne1, ne2, ne3 };
+    const bool can_expand = ggml_is_empty(a) || (
+        ((a->ne[0] == 1) || (a->ne[0] == ne[0])) &&
+        ((a->ne[1] == 1) || (a->ne[1] == ne[1])) &&
+        ((a->ne[2] == 1) || (a->ne[2] == ne[2])) &&
+        ((a->ne[3] == 1) || (a->ne[3] == ne[3]))
+    );
+    GGML_ASSERT(can_expand);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
+
+    result->op     = GGML_OP_EXPAND;
     result->src[0] = a;
 
     return result;
@@ -6524,7 +6805,20 @@ static void ggml_compute_backward(
                 ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false));
             }
         } break;
+        case GGML_OP_REDUCE_MEAN: {
+            if (src0_needs_grads) {
+                const int32_t axis = ggml_get_op_params_i32(tensor, 0);
+                GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+                struct ggml_tensor * g = ggml_repeat(ctx, grad, src0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, g, 1.0f/src0->ne[axis], 0.0f, false));
+            }
+        } break;
         case GGML_OP_REPEAT: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_repeat_back(ctx, grad, src0));
+            }
+        } break;
+        case GGML_OP_EXPAND: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_repeat_back(ctx, grad, src0));
             }
@@ -6863,6 +7157,9 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_GRU: {
+            GGML_ABORT("%s: backward pass for GRU is not implemented\n", __func__);
         } break;
         case GGML_OP_NONE: {
             // noop

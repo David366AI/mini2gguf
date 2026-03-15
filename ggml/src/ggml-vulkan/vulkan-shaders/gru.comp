@@ -1,0 +1,186 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X { X_TYPE data_x[]; };
+layout (binding = 1) readonly buffer W { W_TYPE data_w[]; };
+layout (binding = 2) readonly buffer R { W_TYPE data_r[]; };
+layout (binding = 3) readonly buffer B { W_TYPE data_b[]; };
+layout (binding = 4) readonly buffer H0 { W_TYPE data_h0[]; };
+layout (binding = 5) buffer S { float data_s[]; };
+layout (binding = 6) buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint seq_len;
+    uint batch;
+    uint input_size;
+    uint num_dir;
+    uint hidden;
+
+    uint linear_before_reset;
+    uint direction;
+    uint output_last;
+    uint has_bias;
+    uint has_h0;
+
+    uint x_nb0;
+    uint x_nb1;
+    uint x_nb2;
+
+    uint w_nb0;
+    uint w_nb1;
+    uint w_nb2;
+
+    uint r_nb0;
+    uint r_nb1;
+    uint r_nb2;
+
+    uint b_nb0;
+    uint b_nb1;
+
+    uint h0_nb0;
+    uint h0_nb1;
+    uint h0_nb2;
+
+    uint d_nb0;
+    uint d_nb1;
+    uint d_nb2;
+    uint d_nb3;
+
+    uint scratch_stride;
+} p;
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+float load_x(uint i, uint b, uint t) {
+    return float(data_x[i * p.x_nb0 + b * p.x_nb1 + t * p.x_nb2]);
+}
+
+float load_w(uint i, uint h, uint d) {
+    return float(data_w[i * p.w_nb0 + h * p.w_nb1 + d * p.w_nb2]);
+}
+
+float load_r(uint i, uint h, uint d) {
+    return float(data_r[i * p.r_nb0 + h * p.r_nb1 + d * p.r_nb2]);
+}
+
+float load_b(uint i, uint d) {
+    return float(data_b[i * p.b_nb0 + d * p.b_nb1]);
+}
+
+float load_h0(uint h, uint b, uint d) {
+    return float(data_h0[h * p.h0_nb0 + b * p.h0_nb1 + d * p.h0_nb2]);
+}
+
+void main() {
+    const uint b_idx = gl_WorkGroupID.x;
+    const uint d_idx = gl_WorkGroupID.y;
+
+    if (b_idx >= p.batch || d_idx >= p.num_dir) {
+        return;
+    }
+
+    const bool reverse_dir = p.direction == 1u || (p.direction == 2u && d_idx == 1u);
+
+    const uint slot = d_idx * p.batch + b_idx;
+    const uint base = slot * p.scratch_stride;
+
+    const uint prev_base = base;
+    const uint cur_base  = base + p.hidden;
+    const uint z_base    = base + 2u * p.hidden;
+    const uint rg_base   = base + 3u * p.hidden;
+
+    for (uint h = 0; h < p.hidden; ++h) {
+        data_s[prev_base + h] = p.has_h0 != 0u ? load_h0(h, b_idx, d_idx) : 0.0f;
+    }
+
+    for (uint step = 0; step < p.seq_len; ++step) {
+        const uint t_in = reverse_dir ? (p.seq_len - 1u - step) : step;
+        const uint t_out = reverse_dir ? (p.seq_len - 1u - step) : step;
+
+        for (uint h = 0; h < p.hidden; ++h) {
+            const uint z_off = h;
+            const uint r_off = p.hidden + h;
+
+            float z_pre = 0.0f;
+            float r_pre = 0.0f;
+
+            for (uint i = 0; i < p.input_size; ++i) {
+                const float x_i = load_x(i, b_idx, t_in);
+                z_pre += load_w(i, z_off, d_idx) * x_i;
+                r_pre += load_w(i, r_off, d_idx) * x_i;
+            }
+
+            for (uint j = 0; j < p.hidden; ++j) {
+                const float h_j = data_s[prev_base + j];
+                z_pre += load_r(j, z_off, d_idx) * h_j;
+                r_pre += load_r(j, r_off, d_idx) * h_j;
+            }
+
+            if (p.has_bias != 0u) {
+                z_pre += load_b(h, d_idx) + load_b(3u * p.hidden + h, d_idx);
+                r_pre += load_b(p.hidden + h, d_idx) + load_b(4u * p.hidden + h, d_idx);
+            }
+
+            data_s[z_base + h] = sigmoid(z_pre);
+            data_s[rg_base + h] = sigmoid(r_pre);
+        }
+
+        for (uint h = 0; h < p.hidden; ++h) {
+            const uint h_off = 2u * p.hidden + h;
+            float n_pre = 0.0f;
+
+            for (uint i = 0; i < p.input_size; ++i) {
+                const float x_i = load_x(i, b_idx, t_in);
+                n_pre += load_w(i, h_off, d_idx) * x_i;
+            }
+            if (p.has_bias != 0u) {
+                n_pre += load_b(2u * p.hidden + h, d_idx);
+            }
+
+            if (p.linear_before_reset != 0u) {
+                float rec = 0.0f;
+                for (uint j = 0; j < p.hidden; ++j) {
+                    rec += load_r(j, h_off, d_idx) * data_s[prev_base + j];
+                }
+                if (p.has_bias != 0u) {
+                    rec += load_b(5u * p.hidden + h, d_idx);
+                }
+                n_pre += data_s[rg_base + h] * rec;
+            } else {
+                float rec = 0.0f;
+                for (uint j = 0; j < p.hidden; ++j) {
+                    rec += load_r(j, h_off, d_idx) * (data_s[rg_base + j] * data_s[prev_base + j]);
+                }
+                if (p.has_bias != 0u) {
+                    rec += load_b(5u * p.hidden + h, d_idx);
+                }
+                n_pre += rec;
+            }
+
+            const float n_t = tanh(n_pre);
+            const float h_t = n_t + data_s[z_base + h] * (data_s[prev_base + h] - n_t);
+            data_s[cur_base + h] = h_t;
+
+            if (p.output_last == 0u) {
+                data_d[h * p.d_nb0 + b_idx * p.d_nb1 + d_idx * p.d_nb2 + t_out * p.d_nb3] = h_t;
+            }
+        }
+
+        for (uint h = 0; h < p.hidden; ++h) {
+            data_s[prev_base + h] = data_s[cur_base + h];
+        }
+    }
+
+    if (p.output_last != 0u) {
+        for (uint h = 0; h < p.hidden; ++h) {
+            data_d[h * p.d_nb0 + b_idx * p.d_nb1 + d_idx * p.d_nb2] = data_s[prev_base + h];
+        }
+    }
+}

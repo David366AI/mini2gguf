@@ -1,4 +1,5 @@
 add_library(mini2gguf_runtime
+    src/crnn_utils.cpp
     src/model_runtime.cpp
     src/yolo_utils.cpp
 )

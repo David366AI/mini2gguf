@@ -1232,11 +1232,14 @@ namespace mini2gguf
                 node.epsilon = static_cast<float>(get_f64(*attrs, "epsilon", 1e-5));
                 node.momentum = static_cast<float>(get_f64(*attrs, "momentum", 0.9));
                 node.to = static_cast<int>(get_i64(*attrs, "to", 0));
+                node.hidden_size = static_cast<int>(get_i64(*attrs, "hidden_size", 0));
+                node.linear_before_reset = static_cast<int>(get_i64(*attrs, "linear_before_reset", 0));
                 node.largest = static_cast<int>(get_i64(*attrs, "largest", 1));
                 node.sorted = static_cast<int>(get_i64(*attrs, "sorted", 1));
                 node.fmod = static_cast<int>(get_i64(*attrs, "fmod", 0));
                 node.ceil_mode = static_cast<int>(get_i64(*attrs, "ceil_mode", 0));
                 node.count_include_pad = static_cast<int>(get_i64(*attrs, "count_include_pad", 0));
+                node.direction = get_string(*attrs, "direction", "forward");
 
                 const JsonValue *value = find_obj_key(*attrs, "value");
                 if (value != nullptr && value->type == JsonValue::Type::Object)
@@ -1453,9 +1456,15 @@ namespace mini2gguf
         }
 
         const TensorInfo &input_info = graph_inputs_.front();
-        const int graph_size_hint = std::max<int>(GGML_DEFAULT_GRAPH_SIZE, static_cast<int>(nodes_.size() * 16 + 2048));
+        int graph_size_hint = std::max<int>(GGML_DEFAULT_GRAPH_SIZE, static_cast<int>(nodes_.size() * 16 + 2048));
+        const int env_graph_size_hint = env_int_or_default("MINI2GGUF_GRAPH_SIZE_HINT", 0, 0);
+        if (env_graph_size_hint > 0)
+        {
+            graph_size_hint = std::max(graph_size_hint, env_graph_size_hint);
+        }
+
         // Keep enough tensor slots for graph nodes + views/casts/cont materializations.
-        const int tensor_slots_hint = std::max<int>(graph_size_hint * 2, static_cast<int>(nodes_.size() * 24 + 4096));
+        int tensor_slots_hint = std::max<int>(graph_size_hint * 2, static_cast<int>(nodes_.size() * 24 + 4096));
         ggml_init_params compute_params = {
             static_cast<size_t>(ggml_tensor_overhead() * tensor_slots_hint + ggml_graph_overhead_custom(graph_size_hint, false)),
             nullptr,
@@ -1475,6 +1484,8 @@ namespace mini2gguf
 
         std::unordered_map<std::string, ggml_tensor *> values;
         values.reserve(nodes_.size() * 2 + weight_tensors_.size());
+        std::unordered_map<std::string, HostTensor> host_values;
+        host_values.reserve(nodes_.size());
 
         std::unordered_map<std::string, const NodeDef *> producer_by_output;
         producer_by_output.reserve(nodes_.size() * 2);
@@ -1488,6 +1499,13 @@ namespace mini2gguf
 
         auto resolve_host_tensor = [&](const std::string &name, HostTensor &out) -> bool
         {
+            auto hit = host_values.find(name);
+            if (hit != host_values.end())
+            {
+                out = hit->second;
+                return true;
+            }
+
             auto vit = values.find(name);
             if (vit == values.end())
             {
@@ -1498,13 +1516,23 @@ namespace mini2gguf
             out.ne = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
             const size_t bytes = ggml_nbytes(t);
             out.bytes.resize(bytes);
+            if (bytes == 0)
+            {
+                return true;
+            }
             if (t->buffer != nullptr)
             {
                 ggml_backend_tensor_get(t, out.bytes.data(), 0, bytes);
             }
-            else
+            else if (t->data != nullptr)
             {
                 std::memcpy(out.bytes.data(), t->data, bytes);
+            }
+            else
+            {
+                // Tensor exists in graph but has no host-accessible storage yet.
+                // Treat as unresolved host tensor for shape-constant consumers.
+                return false;
             }
             return true;
         };
@@ -1716,7 +1744,8 @@ namespace mini2gguf
                     {
                         continue;
                     }
-                    if (values.find(input_name) == values.end())
+                    if (values.find(input_name) == values.end() &&
+                        host_values.find(input_name) == host_values.end())
                     {
                         return fail_with_cleanup("input tensor not ready for node " + node.name + ": " + input_name);
                     }
@@ -1734,7 +1763,360 @@ namespace mini2gguf
                 {
                     return fail_with_cleanup("constant tensor missing in gguf: " + node.const_value_name);
                 }
-                values[node.outputs[0]] = wit->second;
+                ggml_tensor *constant_tensor = wit->second;
+                values[node.outputs[0]] = constant_tensor;
+
+                // Keep small/integer constants as host tensors too, so shape-manipulation
+                // ops (Shape/Gather/Unsqueeze/Concat/Slice) can run without backend data buffers.
+                const bool keep_host_copy =
+                    constant_tensor->type == GGML_TYPE_I32 ||
+                    constant_tensor->type == GGML_TYPE_I64 ||
+                    ggml_nelements(constant_tensor) <= 64;
+                if (keep_host_copy)
+                {
+                    HostTensor host;
+                    host.type = static_cast<int>(constant_tensor->type);
+                    host.ne = {constant_tensor->ne[0], constant_tensor->ne[1], constant_tensor->ne[2], constant_tensor->ne[3]};
+                    const size_t bytes = ggml_nbytes(constant_tensor);
+                    host.bytes.resize(bytes);
+                    if (constant_tensor->buffer != nullptr)
+                    {
+                        ggml_backend_tensor_get(constant_tensor, host.bytes.data(), 0, bytes);
+                    }
+                    else
+                    {
+                        std::memcpy(host.bytes.data(), constant_tensor->data, bytes);
+                    }
+                    host_values[node.outputs[0]] = std::move(host);
+                }
+                continue;
+            }
+
+            if (node.op_type == "Relu")
+            {
+                ggml_tensor *x = values.at(node.inputs[0]);
+                if (!ggml_is_contiguous(x))
+                {
+                    x = ggml_cont(ctx, x);
+                }
+                values[node.outputs[0]] = ggml_relu(ctx, x);
+                continue;
+            }
+
+            if (node.op_type == "GRU")
+            {
+                if (node.inputs.size() < 3 || node.outputs.empty())
+                {
+                    return fail_with_cleanup("GRU expects at least 3 inputs and 1 output: " + node.name);
+                }
+
+                ggml_tensor *x = values.at(node.inputs[0]);
+                ggml_tensor *w = values.at(node.inputs[1]);
+                ggml_tensor *r = values.at(node.inputs[2]);
+                ggml_tensor *b = nullptr;
+                if (node.inputs.size() >= 4 && !node.inputs[3].empty())
+                {
+                    b = values.at(node.inputs[3]);
+                }
+
+                ggml_tensor *initial_h = nullptr;
+                if (node.inputs.size() >= 6 && !node.inputs[5].empty())
+                {
+                    auto it_h = values.find(node.inputs[5]);
+                    if (it_h != values.end())
+                    {
+                        initial_h = it_h->second;
+                    }
+                    else
+                    {
+                        HostTensor h_host;
+                        if (!resolve_host_tensor(node.inputs[5], h_host))
+                        {
+                            return fail_with_cleanup("GRU initial_h tensor missing: " + node.name);
+                        }
+                        const bool all_zero = std::all_of(
+                            h_host.bytes.begin(),
+                            h_host.bytes.end(),
+                            [](uint8_t v) { return v == 0; });
+                        if (!all_zero)
+                        {
+                            return fail_with_cleanup("GRU initial_h host tensor requires explicit backend tensor: " + node.name);
+                        }
+                    }
+                }
+
+                const std::string direction = to_lower_copy(node.direction);
+                int dir = GGML_GRU_FORWARD;
+                if (direction == "reverse")
+                {
+                    dir = GGML_GRU_REVERSE;
+                }
+                else if (direction == "bidirectional")
+                {
+                    dir = GGML_GRU_BIDIRECTIONAL;
+                }
+                else if (direction != "forward")
+                {
+                    return fail_with_cleanup("GRU unsupported direction: " + node.direction);
+                }
+
+                if (node.linear_before_reset != 0 && node.linear_before_reset != 1)
+                {
+                    return fail_with_cleanup("GRU linear_before_reset must be 0 or 1: " + node.name);
+                }
+
+                bool y_h_used = false;
+                if (node.outputs.size() >= 2 && !node.outputs[1].empty())
+                {
+                    const std::string &y_h_name = node.outputs[1];
+                    for (const auto &n2 : nodes_)
+                    {
+                        for (const auto &in_name : n2.inputs)
+                        {
+                            if (in_name == y_h_name)
+                            {
+                                y_h_used = true;
+                                break;
+                            }
+                        }
+                        if (y_h_used)
+                        {
+                            break;
+                        }
+                    }
+                    if (!y_h_used)
+                    {
+                        for (const auto &out_info : graph_outputs_)
+                        {
+                            if (out_info.name == y_h_name)
+                            {
+                                y_h_used = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                ggml_tensor *y_h = nullptr;
+                ggml_tensor *y = ggml_gru_onnx(
+                    ctx,
+                    x,
+                    w,
+                    r,
+                    b,
+                    initial_h,
+                    node.hidden_size,
+                    node.linear_before_reset,
+                    dir,
+                    y_h_used ? &y_h : nullptr);
+                values[node.outputs[0]] = y;
+                if (y_h_used && node.outputs.size() >= 2 && !node.outputs[1].empty() && y_h != nullptr)
+                {
+                    values[node.outputs[1]] = y_h;
+                }
+
+                continue;
+            }
+
+            if (node.op_type == "Shape")
+            {
+                if (node.inputs.empty() || node.outputs.empty())
+                {
+                    return fail_with_cleanup("Shape expects 1 input and 1 output: " + node.name);
+                }
+                ggml_tensor *x = values.at(node.inputs[0]);
+                int input_rank = 4;
+                if (auto it = tensor_rank_by_name_.find(node.inputs[0]); it != tensor_rank_by_name_.end() && it->second >= 1 && it->second <= 4)
+                {
+                    input_rank = it->second;
+                }
+                std::vector<int64_t> dims = tensor_to_onnx_dims(x, input_rank);
+
+                HostTensor host;
+                host.type = GGML_TYPE_I64;
+                host.ne = {static_cast<int64_t>(dims.size()), 1, 1, 1};
+                host.bytes.resize(dims.size() * sizeof(int64_t));
+                if (!dims.empty())
+                {
+                    std::memcpy(host.bytes.data(), dims.data(), dims.size() * sizeof(int64_t));
+                }
+                host_values[node.outputs[0]] = std::move(host);
+                continue;
+            }
+
+            if (node.op_type == "ConstantOfShape")
+            {
+                if (node.inputs.empty() || node.outputs.empty())
+                {
+                    return fail_with_cleanup("ConstantOfShape expects 1 input and 1 output: " + node.name);
+                }
+
+                HostTensor shape_host;
+                if (!resolve_host_tensor(node.inputs[0], shape_host))
+                {
+                    return fail_with_cleanup("ConstantOfShape shape tensor missing: " + node.inputs[0]);
+                }
+
+                std::vector<int64_t> shape = to_i64_vector(shape_host);
+                if (shape.size() > 4)
+                {
+                    return fail_with_cleanup("ConstantOfShape rank > 4 is not supported: " + node.name);
+                }
+
+                for (int64_t d : shape)
+                {
+                    if (d < 0)
+                    {
+                        return fail_with_cleanup("ConstantOfShape requires non-negative dims: " + node.name);
+                    }
+                }
+
+                ggml_type out_type = GGML_TYPE_F32;
+                float fill_f32 = 0.0f;
+                int64_t fill_i64 = 0;
+                bool has_scalar_value = false;
+                if (!node.const_value_name.empty())
+                {
+                    HostTensor value_host;
+                    if (resolve_host_tensor(node.const_value_name, value_host) && !value_host.bytes.empty())
+                    {
+                        out_type = static_cast<ggml_type>(value_host.type);
+                        if (out_type != GGML_TYPE_F32 &&
+                            out_type != GGML_TYPE_F16 &&
+                            out_type != GGML_TYPE_I32 &&
+                            out_type != GGML_TYPE_I64)
+                        {
+                            out_type = GGML_TYPE_F32;
+                        }
+
+                        if (value_host.type == GGML_TYPE_F32)
+                        {
+                            const auto *p = reinterpret_cast<const float *>(value_host.bytes.data());
+                            fill_f32 = p[0];
+                            fill_i64 = static_cast<int64_t>(fill_f32);
+                            has_scalar_value = true;
+                        }
+                        else if (value_host.type == GGML_TYPE_F16)
+                        {
+                            const auto *p = reinterpret_cast<const ggml_fp16_t *>(value_host.bytes.data());
+                            fill_f32 = ggml_fp16_to_fp32(p[0]);
+                            fill_i64 = static_cast<int64_t>(fill_f32);
+                            has_scalar_value = true;
+                        }
+                        else if (value_host.type == GGML_TYPE_I32)
+                        {
+                            const auto *p = reinterpret_cast<const int32_t *>(value_host.bytes.data());
+                            fill_i64 = static_cast<int64_t>(p[0]);
+                            fill_f32 = static_cast<float>(fill_i64);
+                            has_scalar_value = true;
+                        }
+                        else if (value_host.type == GGML_TYPE_I64)
+                        {
+                            const auto *p = reinterpret_cast<const int64_t *>(value_host.bytes.data());
+                            fill_i64 = p[0];
+                            fill_f32 = static_cast<float>(fill_i64);
+                            has_scalar_value = true;
+                        }
+                    }
+                }
+                if (!has_scalar_value)
+                {
+                    fill_f32 = 0.0f;
+                    fill_i64 = 0;
+                }
+
+                std::array<int64_t, 4> ne = {1, 1, 1, 1};
+                if (!shape.empty())
+                {
+                    ne = onnx_dims_to_ggml_ne(shape);
+                }
+                const int64_t n = ne[0] * ne[1] * ne[2] * ne[3];
+                if (n < 0)
+                {
+                    return fail_with_cleanup("ConstantOfShape invalid element count: " + node.name);
+                }
+
+                HostTensor host;
+                host.type = static_cast<int>(out_type);
+                host.ne = {ne[0], ne[1], ne[2], ne[3]};
+                host.bytes.resize(static_cast<size_t>(n) * ggml_type_size(out_type));
+
+                if (out_type == GGML_TYPE_F32)
+                {
+                    auto *dst = reinterpret_cast<float *>(host.bytes.data());
+                    std::fill(dst, dst + n, fill_f32);
+                }
+                else if (out_type == GGML_TYPE_F16)
+                {
+                    const ggml_fp16_t v = ggml_fp32_to_fp16(fill_f32);
+                    auto *dst = reinterpret_cast<ggml_fp16_t *>(host.bytes.data());
+                    std::fill(dst, dst + n, v);
+                }
+                else if (out_type == GGML_TYPE_I32)
+                {
+                    const int32_t v = static_cast<int32_t>(fill_i64);
+                    auto *dst = reinterpret_cast<int32_t *>(host.bytes.data());
+                    std::fill(dst, dst + n, v);
+                }
+                else if (out_type == GGML_TYPE_I64)
+                {
+                    auto *dst = reinterpret_cast<int64_t *>(host.bytes.data());
+                    std::fill(dst, dst + n, fill_i64);
+                }
+                else
+                {
+                    return fail_with_cleanup("ConstantOfShape output type is not supported: " + node.name);
+                }
+
+                host_values[node.outputs[0]] = std::move(host);
+                continue;
+            }
+
+            if (node.op_type == "ReduceMean")
+            {
+                ggml_tensor *x = values.at(node.inputs[0]);
+                if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16)
+                {
+                    return fail_with_cleanup("ReduceMean only supports F16/F32: " + node.name);
+                }
+
+                std::vector<int64_t> axes = node.axes;
+                if (axes.empty() && node.inputs.size() >= 2)
+                {
+                    HostTensor axes_tensor;
+                    if (resolve_host_tensor(node.inputs[1], axes_tensor))
+                    {
+                        axes = to_i64_vector(axes_tensor);
+                    }
+                }
+
+                int input_rank = 4;
+                auto rit = tensor_rank_by_name_.find(node.inputs[0]);
+                if (rit != tensor_rank_by_name_.end() && rit->second >= 1 && rit->second <= 4)
+                {
+                    input_rank = rit->second;
+                }
+
+                if (axes.empty())
+                {
+                    axes.reserve(input_rank);
+                    for (int i = 0; i < input_rank; ++i)
+                    {
+                        axes.push_back(i);
+                    }
+                }
+                if (axes.size() != 1)
+                {
+                    return fail_with_cleanup("ReduceMean currently only supports single axis: " + node.name);
+                }
+
+                ggml_tensor *y = ggml_reduce_mean_onnx(
+                    ctx,
+                    x,
+                    static_cast<int32_t>(axes[0]),
+                    input_rank,
+                    node.keepdims != 0);
+                values[node.outputs[0]] = y;
                 continue;
             }
 
@@ -2141,7 +2523,6 @@ namespace mini2gguf
                 values[node.outputs[0]] = ggml_leaky_relu(ctx, x, node.alpha, false);
                 continue;
             }
-
             if (node.op_type == "BatchNormalization")
             {
                 if (node.inputs.size() < 5)
@@ -2560,19 +2941,11 @@ namespace mini2gguf
                 values[node.outputs[0]] = y;
                 continue;
             }
-
             if (node.op_type == "Slice")
             {
                 if (node.inputs.size() < 4)
                 {
                     return fail_with_cleanup("Slice expects at least 4 inputs: " + node.name);
-                }
-                ggml_tensor *x = values.at(node.inputs[0]);
-                if (!ggml_is_contiguous(x))
-                {
-                    // Slice below is built with ggml_view_4d, which cannot represent arbitrary nb[0].
-                    // Materialize permuted/view tensors first to keep offsets/strides correct.
-                    x = ggml_cont(ctx, x);
                 }
                 HostTensor starts_t, ends_t, axes_t;
                 if (!resolve_host_tensor(node.inputs[1], starts_t) ||
@@ -2596,6 +2969,95 @@ namespace mini2gguf
                     input_rank = rit->second;
                 }
                 const int axis_ggml = map_onnx_axis_to_ggml(static_cast<int>(axes[0]), input_rank);
+
+                auto x_host_it = host_values.find(node.inputs[0]);
+                if (x_host_it != host_values.end())
+                {
+                    const HostTensor &x_host = x_host_it->second;
+                    const std::array<int64_t, 4> x_ne = {x_host.ne[0], x_host.ne[1], x_host.ne[2], x_host.ne[3]};
+                    const int64_t dim = x_ne[axis_ggml];
+                    int64_t start = starts[0] < 0 ? starts[0] + dim : starts[0];
+                    int64_t end = ends[0] < 0 ? ends[0] + dim : ends[0];
+                    start = std::max<int64_t>(0, std::min<int64_t>(start, dim));
+                    end = std::max<int64_t>(start, std::min<int64_t>(end, dim));
+
+                    HostTensor out_host;
+                    out_host.type = x_host.type;
+                    out_host.ne = {x_ne[0], x_ne[1], x_ne[2], x_ne[3]};
+                    out_host.ne[axis_ggml] = end - start;
+
+                    const ggml_type t = static_cast<ggml_type>(x_host.type);
+                    const size_t tsz = ggml_type_size(t);
+                    const std::array<size_t, 4> x_nb = {
+                        tsz,
+                        tsz * static_cast<size_t>(x_ne[0]),
+                        tsz * static_cast<size_t>(x_ne[0] * x_ne[1]),
+                        tsz * static_cast<size_t>(x_ne[0] * x_ne[1] * x_ne[2])};
+                    const std::array<size_t, 4> out_nb = {
+                        tsz,
+                        tsz * static_cast<size_t>(out_host.ne[0]),
+                        tsz * static_cast<size_t>(out_host.ne[0] * out_host.ne[1]),
+                        tsz * static_cast<size_t>(out_host.ne[0] * out_host.ne[1] * out_host.ne[2])};
+
+                    const size_t out_nbytes =
+                        static_cast<size_t>(out_host.ne[0] * out_host.ne[1] * out_host.ne[2] * out_host.ne[3]) * tsz;
+                    out_host.bytes.resize(out_nbytes);
+
+                    for (int64_t i3 = 0; i3 < out_host.ne[3]; ++i3)
+                    {
+                        for (int64_t i2 = 0; i2 < out_host.ne[2]; ++i2)
+                        {
+                            for (int64_t i1 = 0; i1 < out_host.ne[1]; ++i1)
+                            {
+                                for (int64_t i0 = 0; i0 < out_host.ne[0]; ++i0)
+                                {
+                                    int64_t s0 = i0;
+                                    int64_t s1 = i1;
+                                    int64_t s2 = i2;
+                                    int64_t s3 = i3;
+                                    if (axis_ggml == 0)
+                                    {
+                                        s0 += start;
+                                    }
+                                    else if (axis_ggml == 1)
+                                    {
+                                        s1 += start;
+                                    }
+                                    else if (axis_ggml == 2)
+                                    {
+                                        s2 += start;
+                                    }
+                                    else
+                                    {
+                                        s3 += start;
+                                    }
+
+                                    const size_t src_off =
+                                        static_cast<size_t>(s0) * x_nb[0] +
+                                        static_cast<size_t>(s1) * x_nb[1] +
+                                        static_cast<size_t>(s2) * x_nb[2] +
+                                        static_cast<size_t>(s3) * x_nb[3];
+                                    const size_t dst_off =
+                                        static_cast<size_t>(i0) * out_nb[0] +
+                                        static_cast<size_t>(i1) * out_nb[1] +
+                                        static_cast<size_t>(i2) * out_nb[2] +
+                                        static_cast<size_t>(i3) * out_nb[3];
+                                    std::memcpy(out_host.bytes.data() + dst_off, x_host.bytes.data() + src_off, tsz);
+                                }
+                            }
+                        }
+                    }
+                    host_values[node.outputs[0]] = std::move(out_host);
+                    continue;
+                }
+
+                ggml_tensor *x = values.at(node.inputs[0]);
+                if (!ggml_is_contiguous(x))
+                {
+                    // Slice below is built with ggml_view_4d, which cannot represent arbitrary nb[0].
+                    // Materialize permuted/view tensors first to keep offsets/strides correct.
+                    x = ggml_cont(ctx, x);
+                }
                 const int64_t dim = x->ne[axis_ggml];
                 if (env_flag_enabled("MINI2GGUF_DEBUG_SLICE"))
                 {
@@ -2628,7 +3090,6 @@ namespace mini2gguf
                 {
                     return fail_with_cleanup("Unsqueeze expects data + axes: " + node.name);
                 }
-                ggml_tensor *x = values.at(node.inputs[0]);
                 HostTensor axes_t;
                 if (!resolve_host_tensor(node.inputs[1], axes_t))
                 {
@@ -2642,11 +3103,10 @@ namespace mini2gguf
 
                 int input_rank = 4;
                 auto rit = tensor_rank_by_name_.find(node.inputs[0]);
-                if (rit != tensor_rank_by_name_.end() && rit->second >= 1 && rit->second <= 4)
+                if (rit != tensor_rank_by_name_.end() && rit->second >= 0 && rit->second <= 4)
                 {
                     input_rank = rit->second;
                 }
-                std::vector<int64_t> dims = tensor_to_onnx_dims(x, input_rank);
                 int axis = static_cast<int>(axes[0]);
                 if (axis < 0)
                 {
@@ -2656,24 +3116,46 @@ namespace mini2gguf
                 {
                     return fail_with_cleanup("Unsqueeze axis out of range: " + node.name);
                 }
-                dims.insert(dims.begin() + axis, 1);
 
-                if (!ggml_is_contiguous(x))
+                HostTensor x_host;
+                if (resolve_host_tensor(node.inputs[0], x_host) && values.find(node.inputs[0]) == values.end())
                 {
-                    x = ggml_cont(ctx, x);
-                }
-                const auto ne = onnx_dims_to_ggml_ne(dims);
-                if (dims.size() == 2)
-                {
-                    values[node.outputs[0]] = ggml_reshape_2d(ctx, x, ne[0], ne[1]);
-                }
-                else if (dims.size() == 3)
-                {
-                    values[node.outputs[0]] = ggml_reshape_3d(ctx, x, ne[0], ne[1], ne[2]);
+                    std::vector<int64_t> dims;
+                    dims.reserve(static_cast<size_t>(input_rank + 1));
+                    for (int i = 0; i < input_rank; ++i)
+                    {
+                        dims.push_back(x_host.ne[static_cast<size_t>(input_rank - 1 - i)]);
+                    }
+                    dims.insert(dims.begin() + axis, 1);
+
+                    HostTensor out_host = x_host;
+                    const auto ne = onnx_dims_to_ggml_ne(dims);
+                    out_host.ne = {ne[0], ne[1], ne[2], ne[3]};
+                    host_values[node.outputs[0]] = std::move(out_host);
                 }
                 else
                 {
-                    values[node.outputs[0]] = ggml_reshape_4d(ctx, x, ne[0], ne[1], ne[2], ne[3]);
+                    ggml_tensor *x = values.at(node.inputs[0]);
+                    std::vector<int64_t> dims = tensor_to_onnx_dims(x, input_rank);
+                    dims.insert(dims.begin() + axis, 1);
+
+                    if (!ggml_is_contiguous(x))
+                    {
+                        x = ggml_cont(ctx, x);
+                    }
+                    const auto ne = onnx_dims_to_ggml_ne(dims);
+                    if (dims.size() == 2)
+                    {
+                        values[node.outputs[0]] = ggml_reshape_2d(ctx, x, ne[0], ne[1]);
+                    }
+                    else if (dims.size() == 3)
+                    {
+                        values[node.outputs[0]] = ggml_reshape_3d(ctx, x, ne[0], ne[1], ne[2]);
+                    }
+                    else
+                    {
+                        values[node.outputs[0]] = ggml_reshape_4d(ctx, x, ne[0], ne[1], ne[2], ne[3]);
+                    }
                 }
                 continue;
             }
@@ -2747,6 +3229,63 @@ namespace mini2gguf
                 }
                 const auto ne = onnx_dims_to_ggml_ne(dims);
                 values[node.outputs[0]] = ggml_repeat_4d(ctx, x, ne[0], ne[1], ne[2], ne[3]);
+                continue;
+            }
+
+            if (node.op_type == "Expand")
+            {
+                if (node.inputs.size() < 2)
+                {
+                    return fail_with_cleanup("Expand expects 2 inputs: " + node.name);
+                }
+
+                ggml_tensor *x = values.at(node.inputs[0]);
+                HostTensor shape_t;
+                if (!resolve_host_tensor(node.inputs[1], shape_t))
+                {
+                    return fail_with_cleanup("Expand shape tensor missing: " + node.name);
+                }
+
+                const std::vector<int64_t> target_dims = to_i64_vector(shape_t);
+                if (target_dims.empty() || target_dims.size() > 4)
+                {
+                    return fail_with_cleanup("Expand target shape rank must be in [1,4]: " + node.name);
+                }
+
+                int input_rank = 4;
+                auto rit = tensor_rank_by_name_.find(node.inputs[0]);
+                if (rit != tensor_rank_by_name_.end() && rit->second >= 1 && rit->second <= 4)
+                {
+                    input_rank = rit->second;
+                }
+                const std::vector<int64_t> input_dims = tensor_to_onnx_dims(x, input_rank);
+                const int out_rank = std::max(static_cast<int>(target_dims.size()), static_cast<int>(input_dims.size()));
+                if (out_rank > 4)
+                {
+                    return fail_with_cleanup("Expand output rank > 4 is not supported: " + node.name);
+                }
+
+                std::vector<int64_t> input_aligned(static_cast<size_t>(out_rank), 1);
+                std::vector<int64_t> output_aligned(static_cast<size_t>(out_rank), 1);
+                std::copy(input_dims.begin(), input_dims.end(), input_aligned.end() - input_dims.size());
+                std::copy(target_dims.begin(), target_dims.end(), output_aligned.end() - target_dims.size());
+
+                for (int i = 0; i < out_rank; ++i)
+                {
+                    const int64_t in_dim = input_aligned[static_cast<size_t>(i)];
+                    const int64_t out_dim = output_aligned[static_cast<size_t>(i)];
+                    if (out_dim <= 0)
+                    {
+                        return fail_with_cleanup("Expand requires positive target dims: " + node.name);
+                    }
+                    if (!(in_dim == out_dim || in_dim == 1))
+                    {
+                        return fail_with_cleanup("Expand broadcast mismatch: " + node.name);
+                    }
+                }
+
+                const auto ne = onnx_dims_to_ggml_ne(output_aligned);
+                values[node.outputs[0]] = ggml_expand_4d(ctx, x, ne[0], ne[1], ne[2], ne[3]);
                 continue;
             }
 
@@ -2968,7 +3507,6 @@ namespace mini2gguf
                 values[node.outputs[0]] = ggml_pool_2d(ctx, x, pool_op, k0, k1, s0, s1, p0, p1);
                 continue;
             }
-
             if (node.op_type == "ReduceMax")
             {
                 ggml_tensor *x = values.at(node.inputs[0]);
@@ -3108,6 +3646,25 @@ namespace mini2gguf
                     input_rank = it->second;
                 }
                 std::vector<int64_t> input_dims_onnx = tensor_to_onnx_dims(x, input_rank);
+                if (env_flag_enabled("MINI2GGUF_DEBUG_RESHAPE"))
+                {
+                    std::cout << "reshape debug: node=" << node.name
+                              << " input_rank=" << input_rank
+                              << " x.ne=[" << x->ne[0] << "," << x->ne[1] << "," << x->ne[2] << "," << x->ne[3] << "]"
+                              << " input_dims_onnx=[";
+                    for (size_t i = 0; i < input_dims_onnx.size(); ++i)
+                    {
+                        if (i > 0) std::cout << ",";
+                        std::cout << input_dims_onnx[i];
+                    }
+                    std::cout << "] shape_raw=[";
+                    for (size_t i = 0; i < shape.size(); ++i)
+                    {
+                        if (i > 0) std::cout << ",";
+                        std::cout << shape[i];
+                    }
+                    std::cout << "]" << std::endl;
+                }
                 int64_t known_product = 1;
                 int infer_idx = -1;
                 for (size_t i = 0; i < shape.size(); ++i)
@@ -3119,20 +3676,37 @@ namespace mini2gguf
                             return fail_with_cleanup("Reshape uses 0 for out-of-range input axis: " + node.name);
                         }
                         shape[i] = input_dims_onnx[i];
+                        known_product *= shape[i];
                     }
                     else if (shape[i] == -1)
                     {
+                        if (infer_idx >= 0)
+                        {
+                            return fail_with_cleanup("Reshape supports only one -1 dim: " + node.name);
+                        }
                         infer_idx = static_cast<int>(i);
                     }
                     else
                     {
+                        if (shape[i] < 0)
+                        {
+                            return fail_with_cleanup("Reshape has unsupported negative dim: " + node.name);
+                        }
                         known_product *= shape[i];
                     }
                 }
                 const int64_t total = ggml_nelements(x);
                 if (infer_idx >= 0)
                 {
+                    if (known_product <= 0 || total % known_product != 0)
+                    {
+                        return fail_with_cleanup("Reshape cannot infer -1 dim due to non-divisible element count: " + node.name);
+                    }
                     shape[infer_idx] = total / known_product;
+                }
+                else if (known_product != total)
+                {
+                    return fail_with_cleanup("Reshape element count mismatch: " + node.name);
                 }
 
                 const auto ne = onnx_dims_to_ggml_ne(shape);
@@ -3151,6 +3725,18 @@ namespace mini2gguf
                 }
                 else if (shape.size() == 3)
                 {
+                    const int64_t expect = ne[0] * ne[1] * ne[2];
+                    const int64_t have = ggml_nelements(x);
+                    if (have != expect)
+                    {
+                        std::ostringstream oss;
+                        oss << "Reshape(3d) element mismatch in " << node.name
+                            << " have=" << have
+                            << " expect=" << expect
+                            << " ne=[" << ne[0] << "," << ne[1] << "," << ne[2] << "]"
+                            << " x.ne=[" << x->ne[0] << "," << x->ne[1] << "," << x->ne[2] << "," << x->ne[3] << "]";
+                        return fail_with_cleanup(oss.str());
+                    }
                     y = ggml_reshape_3d(ctx, x, ne[0], ne[1], ne[2]);
                 }
                 else
@@ -3221,6 +3807,53 @@ namespace mini2gguf
                     input_rank = it->second;
                 }
                 const int axis_ggml = map_onnx_axis_to_ggml(node.axis, input_rank);
+
+                bool all_host = !node.inputs.empty();
+                for (const std::string &in_name : node.inputs)
+                {
+                    if (host_values.find(in_name) == host_values.end())
+                    {
+                        all_host = false;
+                        break;
+                    }
+                }
+                if (all_host)
+                {
+                    if (axis_ggml != input_rank - 1)
+                    {
+                        return fail_with_cleanup("Concat(host) currently supports axis=0 only: " + node.name);
+                    }
+                    if (node.inputs.empty())
+                    {
+                        return fail_with_cleanup("Concat(host) has no inputs: " + node.name);
+                    }
+
+                    HostTensor out = host_values.at(node.inputs[0]);
+                    for (size_t i = 1; i < node.inputs.size(); ++i)
+                    {
+                        const HostTensor &rhs = host_values.at(node.inputs[i]);
+                        if (rhs.type != out.type)
+                        {
+                            return fail_with_cleanup("Concat(host) type mismatch: " + node.name);
+                        }
+                        for (int d = 0; d < 4; ++d)
+                        {
+                            if (d == axis_ggml)
+                            {
+                                continue;
+                            }
+                            if (out.ne[d] != rhs.ne[d])
+                            {
+                                return fail_with_cleanup("Concat(host) shape mismatch: " + node.name);
+                            }
+                        }
+                        out.bytes.insert(out.bytes.end(), rhs.bytes.begin(), rhs.bytes.end());
+                        out.ne[axis_ggml] += rhs.ne[axis_ggml];
+                    }
+                    host_values[node.outputs[0]] = std::move(out);
+                    continue;
+                }
+
                 ggml_tensor *y = values.at(node.inputs[0]);
                 if (force_concat_f32 && y->type != GGML_TYPE_F32)
                 {
@@ -3281,6 +3914,76 @@ namespace mini2gguf
                 {
                     return fail_with_cleanup("Gather expects 2 inputs and 1 output: " + node.name);
                 }
+
+                HostTensor data_host;
+                HostTensor indices_host;
+                const bool has_host_data = resolve_host_tensor(node.inputs[0], data_host);
+                const bool has_host_idx = resolve_host_tensor(node.inputs[1], indices_host);
+                if (has_host_data && has_host_idx)
+                {
+                    if (node.axis != 0)
+                    {
+                        return fail_with_cleanup("Gather(host) currently only supports axis=0: " + node.name);
+                    }
+                    if (data_host.type != GGML_TYPE_I64 && data_host.type != GGML_TYPE_I32)
+                    {
+                        return fail_with_cleanup("Gather(host) data must be I32/I64: " + node.name);
+                    }
+                    if (indices_host.type != GGML_TYPE_I64 && indices_host.type != GGML_TYPE_I32)
+                    {
+                        return fail_with_cleanup("Gather(host) indices must be I32/I64: " + node.name);
+                    }
+
+                    const std::vector<int64_t> data_vals = to_i64_vector(data_host);
+                    const std::vector<int64_t> idx_vals = to_i64_vector(indices_host);
+                    if (data_vals.empty())
+                    {
+                        return fail_with_cleanup("Gather(host) data is empty: " + node.name);
+                    }
+                    if (idx_vals.empty())
+                    {
+                        return fail_with_cleanup("Gather(host) indices are empty: " + node.name);
+                    }
+
+                    std::vector<int64_t> out_vals;
+                    out_vals.reserve(idx_vals.size());
+                    const int64_t n = static_cast<int64_t>(data_vals.size());
+                    for (int64_t idx : idx_vals)
+                    {
+                        int64_t at = idx;
+                        if (at < 0)
+                        {
+                            at += n;
+                        }
+                        if (at < 0 || at >= n)
+                        {
+                            return fail_with_cleanup("Gather(host) index out of range: " + node.name);
+                        }
+                        out_vals.push_back(data_vals[static_cast<size_t>(at)]);
+                    }
+
+                    HostTensor out_host;
+                    out_host.type = data_host.type;
+                    out_host.ne = {static_cast<int64_t>(out_vals.size()), 1, 1, 1};
+                    if (out_host.type == GGML_TYPE_I64)
+                    {
+                        out_host.bytes.resize(out_vals.size() * sizeof(int64_t));
+                        std::memcpy(out_host.bytes.data(), out_vals.data(), out_host.bytes.size());
+                    }
+                    else
+                    {
+                        std::vector<int32_t> out_i32(out_vals.size());
+                        for (size_t i = 0; i < out_vals.size(); ++i)
+                        {
+                            out_i32[i] = static_cast<int32_t>(out_vals[i]);
+                        }
+                        out_host.bytes.resize(out_i32.size() * sizeof(int32_t));
+                        std::memcpy(out_host.bytes.data(), out_i32.data(), out_host.bytes.size());
+                    }
+                    host_values[node.outputs[0]] = std::move(out_host);
+                    continue;
+                }
+
                 if (node.axis != 0)
                 {
                     return fail_with_cleanup("Gather currently only supports axis=0: " + node.name);

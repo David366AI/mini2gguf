@@ -1,0 +1,67 @@
+#version 450
+
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared FLOAT_TYPE tmp[BLOCK_SIZE];
+
+layout (push_constant) uniform parameter {
+    uint reduce_ne;
+    uint axis;
+    uint ne0, ne1, ne2, ne3;
+    uint nb0, nb1, nb2, nb3;
+    uint dne0, dne1, dne2, dne3;
+    uint dnb0, dnb1, dnb2, dnb3;
+    uint misalign_offsets;
+} p;
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_doffset() { return p.misalign_offsets & 0xFFFF; }
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+
+    const uint out_ne = p.dne0 * p.dne1 * p.dne2 * p.dne3;
+    if (row >= out_ne) {
+        return;
+    }
+
+    uint rem = row;
+    const uint i0 = rem % p.dne0;
+    rem /= p.dne0;
+    const uint i1 = rem % p.dne1;
+    rem /= p.dne1;
+    const uint i2 = rem % p.dne2;
+    rem /= p.dne2;
+    const uint i3 = rem % p.dne3;
+
+    const uint axis_stride = p.axis == 0 ? p.nb0 : (p.axis == 1 ? p.nb1 : (p.axis == 2 ? p.nb2 : p.nb3));
+    const uint src_base = get_aoffset() + i0 * p.nb0 + i1 * p.nb1 + i2 * p.nb2 + i3 * p.nb3;
+    const uint dst_idx = get_doffset() + i0 * p.dnb0 + i1 * p.dnb1 + i2 * p.dnb2 + i3 * p.dnb3;
+
+    tmp[col] = FLOAT_TYPE(0.0);
+    for (uint i = col; i < p.reduce_ne; i += BLOCK_SIZE) {
+        tmp[col] += FLOAT_TYPE(data_a[src_base + i * axis_stride]);
+    }
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            tmp[col] += tmp[col + s];
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        data_d[dst_idx] = D_TYPE(tmp[0] / FLOAT_TYPE(p.reduce_ne));
+    }
+}

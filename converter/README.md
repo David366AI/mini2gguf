@@ -137,6 +137,39 @@ Notes:
   - `model.class=<your -c>`
 - When input is `.pt`, intermediate `.onnx` and `.onnx.data` are removed after successful conversion.
 
+## 4) `crnn2gguf.py`
+
+One-step converter for CRNN ONNX models to GGUF, with CTC dictionary metadata.
+
+Script:
+
+```bash
+python converter/crnn2gguf.py -i <model.onnx> -d <dict.txt> [options]
+```
+
+Arguments:
+
+- `-i, --input` (required): input `.onnx`
+- `-d, --dict` (required): dictionary file, one character per line
+- `-o, --output-dir`: output directory
+- `--export-half/--no-export-half`: reserved for PT input compatibility (no effect for ONNX input)
+- `--weight-f16/--no-weight-f16`: GGUF weight cast toggle
+- `--split`: export `<stem>.json` separately instead of embedding graph JSON
+
+Example:
+
+```bash
+python converter/crnn2gguf.py \
+  -i assets/models/crnn/ocr_number.onnx \
+  -d assets/models/crnn/dict_number.txt
+```
+
+Notes:
+
+- `crnn2gguf.py` always writes:
+  - `model.family=crnn`
+  - `model.dict=<newline separated dict entries>`
+
 ## End-to-End: Darknet -> ONNX -> GGUF
 
 ```bash

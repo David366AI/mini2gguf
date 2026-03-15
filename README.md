@@ -1,12 +1,11 @@
 # mini2gguf
 
-`mini2gguf` is a toolchain for converting compact vision models (mainly YOLO-family models) into GGUF, then running dynamic inference with [ggml](https://github.com/ggml-org/ggml). 
-It will support yolo classification, segment and CRNN inference in next several release.
+`mini2gguf` is a toolchain for converting compact vision models (mainly YOLO-family models) into GGUF, then running dynamic inference with [ggml](https://github.com/ggml-org/ggml).
 
 Current scope:
 
 - Model conversion: `pt/onnx/cfg+weights -> gguf`
-- Runtime inference: dynamic graph execution + YOLO postprocessing (including NMS)
+- Runtime inference: dynamic graph execution + YOLO postprocessing (detection/segmentation) + CRNN postprocessing
 - Example programs: detection demo and performance benchmark
 
 ## 1. Project Goals
@@ -184,8 +183,8 @@ YOLO detection demo:
   -a \
   -b auto
 
-./build/examples/cpp/yolo_demo -m assets/models/yolo/yolov3-tiny.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
-./build/examples/cpp/yolo_demo -m assets/models/yolo/yolo26n.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
+./build/examples/yolo_demo -m assets/models/yolo/yolov3-tiny.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
+./build/examples/yolo_demo -m assets/models/yolo/yolo26n.gguf -i assets/images/dog.jpg -o ./assets/images/predictions_dynamic.jpg --conf 0.45 --iou 0.45 -a
 ```
 
 Result preview:
@@ -249,7 +248,31 @@ Arguments:
 - `--bench_iters`: alias of `--betch_iters`
 - `-d, --backend`: `auto|cpu|gpu|vulkanN|cudaN`
 
-## 8. Additional Notes
+## 8. CRNN
+
+### 8.1 Convert ONNX -> GGUF
+
+```bash
+python ./converter/crnn2gguf.py -i ./assets/models/crnn/ocr_number.onnx -d ./assets/models/crnn/dict_number.txt
+```
+
+### 8.2 Inference
+
+```bash
+./build/examples/yolo_demo -m assets/models/crnn/ocr_number.gguf -i assets/images/crnn-test.jpg
+./build/examples/yolo_demo -m assets/models/crnn/ocr_number.gguf -i assets/images/crnn-test2.jpg
+./build/examples/yolo_demo -m assets/models/crnn/ocr_number.gguf -i assets/images/crnn-test3.jpg
+./build/examples/yolo_demo -m assets/models/crnn/ocr_number.gguf -i assets/images/crnn-test4.jpg
+```
+
+### 8.3 Input Samples
+
+![CRNN input sample 1](assets/images/crnn-test.jpg)
+![CRNN input sample 2](assets/images/crnn-test2.jpg)
+![CRNN input sample 3](assets/images/crnn-test3.jpg)
+![CRNN input sample 4](assets/images/crnn-test4.jpg)
+
+## 9. Additional Notes
 
 ### A. Runtime Backend Selection
 
@@ -266,10 +289,12 @@ If you convert ONNX manually, ensure metadata is set correctly (for example, `on
 - `converter/darknet2onnx.py`
 - `converter/onnx2gguf.py`
 - `converter/yolo2gguf.py`
+- `converter/crnn2gguf.py`
 
 For full converter arguments, run `--help` on each script.
 
-## 9. GGML change
+
+## 10. GGML change
 - Add OP support for GatherElements/ReduceMax/Gather for CPU/Vulkan/CUDA
 - Optimize Conv 2D because of performance for CPU backend 
 - Support Conv F16 completely

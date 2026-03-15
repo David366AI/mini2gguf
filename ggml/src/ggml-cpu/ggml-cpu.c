@@ -1806,6 +1806,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mean(params, tensor);
             } break;
+        case GGML_OP_REDUCE_MEAN:
+            {
+                ggml_compute_forward_reduce_mean(params, tensor);
+            } break;
         case GGML_OP_REDUCE_MAX:
             {
                 ggml_compute_forward_reduce_max(params, tensor);
@@ -1819,6 +1823,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_count_equal(params, tensor);
             } break;
         case GGML_OP_REPEAT:
+            {
+                ggml_compute_forward_repeat(params, tensor);
+            } break;
+        case GGML_OP_EXPAND:
             {
                 ggml_compute_forward_repeat(params, tensor);
             } break;
@@ -1853,6 +1861,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_L2_NORM:
             {
                 ggml_compute_forward_l2_norm(params, tensor);
+            } break;
+        case GGML_OP_GRU:
+            {
+                ggml_compute_forward_gru(params, tensor);
             } break;
         case GGML_OP_MUL_MAT:
             {
@@ -2247,8 +2259,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
+        case GGML_OP_REDUCE_MEAN:
         case GGML_OP_REDUCE_MAX:
         case GGML_OP_ARGMAX:
+        case GGML_OP_GRU:
             {
                 n_tasks = 1;
             } break;
@@ -2258,6 +2272,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_REPEAT:
+        case GGML_OP_EXPAND:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_LEAKY_RELU:
             {
