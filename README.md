@@ -298,6 +298,7 @@ For full converter arguments, run `--help` on each script.
 
 
 ## 10. GGML change
-- Add OP support for GatherElements/ReduceMax/Gather for CPU/Vulkan/CUDA
+- Add OP support for GatherElements/Gather/ReduceMax for CPU/Vulkan/CUDA
+- Add OP support for GRU/ReduceMean/Shape for CPU/Vulkan/CUDA
 - Optimize Conv 2D because of performance for CPU backend 
 - Support Conv F16 completely
